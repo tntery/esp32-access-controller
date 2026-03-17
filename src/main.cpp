@@ -87,7 +87,7 @@ void sendToServer(uint32_t cardNumber) {
     http.begin(apiUrl);
     http.addHeader("Content-Type", "application/json");
 
-    String payload = "{\"ma300_id\":\"" + String(cardNumber) + "\"}";
+    String payload = "{\"access_id\":\"" + String(cardNumber) + "\"}";
     feedbackProcessing();
     int httpResponseCode = http.POST(payload);
 
@@ -95,9 +95,14 @@ void sendToServer(uint32_t cardNumber) {
       String response = http.getString();
       Serial.println("Server response: " + response);
 
-      if(response.indexOf("\"access\":\"GRANT\"") >= 0) {
+      // parse {"access": "GRANT"}
+
+
+      if(response.indexOf("\"access\": \"GRANT\"") >= 0) {
+        Serial.println("Access granted by server");
         grant();
       } else {
+        Serial.println("Access denied by server");
         feedbackReject();
       }
     } else {
