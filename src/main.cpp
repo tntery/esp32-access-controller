@@ -13,17 +13,6 @@ const int MAGLOCK_RELAY = GPIO_NUM_26;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
-const uint8_t WIEGAND_26_BITS = 26;
-const uint8_t WIEGAND_34_BITS = 34;
-const uint8_t WIEGAND_MAX_BITS = 64;
-const uint32_t WIEGAND_FRAME_GAP_US = 2500;
-
-volatile uint8_t WIEGAND_BIT_BUFFER[WIEGAND_MAX_BITS];
-volatile uint8_t WIEGAND_BIT_COUNT = 0;
-volatile uint32_t WIEGAND_LAST_BIT_US = 0;
-
-portMUX_TYPE WIEGAND_MUX = portMUX_INITIALIZER_UNLOCKED;
-
 int short CURRENT_LED_REJECTED_STATE = LOW;
 
 // WiFi credentials
@@ -33,38 +22,43 @@ const char* password = WIFI_PASSWORD;
 // Backend API endpoint
 const char* apiUrl = API_URL;
 
-void IRAM_ATTR pushWiegandBit(uint8_t bit) {
+void sendToServer(uint32_t accessId);
+
+////////////////// Wiegand decoding logic below ///
+
+constexpr uint8_t MAX_WIEGAND_BITS = 64;
+constexpr uint32_t FRAME_GAP_US = 2500;
+
+volatile uint8_t g_bitBuffer[MAX_WIEGAND_BITS];
+volatile uint8_t g_bitCount = 0;
+volatile uint32_t g_lastBitMicros = 0;
+
+portMUX_TYPE g_wiegandMux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR pushBit(uint8_t bit) {
   const uint32_t now = micros();
 
-  portENTER_CRITICAL_ISR(&WIEGAND_MUX);
-  if (WIEGAND_BIT_COUNT < WIEGAND_MAX_BITS) {
-    WIEGAND_BIT_BUFFER[WIEGAND_BIT_COUNT++] = bit;
-    WIEGAND_LAST_BIT_US = now;
+  portENTER_CRITICAL_ISR(&g_wiegandMux);
+  if (g_bitCount < MAX_WIEGAND_BITS) {
+    g_bitBuffer[g_bitCount++] = bit;
+    g_lastBitMicros = now;
   } else {
-    // Drop the frame if overflow occurs to avoid processing corrupt data.
-    WIEGAND_BIT_COUNT = 0;
-    WIEGAND_LAST_BIT_US = 0;
+    // Buffer full: reset so we do not keep reporting corrupt frames.
+    g_bitCount = 0;
+    g_lastBitMicros = 0;
   }
-  portEXIT_CRITICAL_ISR(&WIEGAND_MUX);
+  portEXIT_CRITICAL_ISR(&g_wiegandMux);
 }
 
-void IRAM_ATTR onWiegandD0() {
-  pushWiegandBit(0);
+void IRAM_ATTR onD0Pulse() {
+  pushBit(0);
 }
 
-void IRAM_ATTR onWiegandD1() {
-  pushWiegandBit(1);
+void IRAM_ATTR onD1Pulse() {
+  pushBit(1);
 }
 
-uint32_t bitsToUint32(const uint8_t *bits, uint8_t startInclusive, uint8_t endInclusive) {
-  uint32_t value = 0;
-  for (uint8_t i = startInclusive; i <= endInclusive; i++) {
-    value = (value << 1) | bits[i];
-  }
-  return value;
-}
-
-bool decodeWiegand26(const uint8_t *bits, uint32_t& cardNumber, uint8_t& facilityCode, uint16_t& cardCode) {
+bool checkParity26(const uint8_t *bits) {
   uint8_t firstHalfOnes = 0;
   uint8_t secondHalfOnes = 0;
 
@@ -78,17 +72,10 @@ bool decodeWiegand26(const uint8_t *bits, uint32_t& cardNumber, uint8_t& facilit
 
   const bool evenOk = ((firstHalfOnes + bits[0]) % 2) == 0;
   const bool oddOk = ((secondHalfOnes + bits[25]) % 2) == 1;
-  if (!evenOk || !oddOk) {
-    return false;
-  }
-
-  facilityCode = (uint8_t)bitsToUint32(bits, 1, 8);
-  cardCode = (uint16_t)bitsToUint32(bits, 9, 24);
-  cardNumber = bitsToUint32(bits, 1, 24);
-  return true;
+  return evenOk && oddOk;
 }
 
-bool decodeWiegand34(const uint8_t *bits, uint32_t& cardNumber) {
+bool checkParity34(const uint8_t *bits) {
   uint8_t firstHalfOnes = 0;
   uint8_t secondHalfOnes = 0;
 
@@ -102,89 +89,89 @@ bool decodeWiegand34(const uint8_t *bits, uint32_t& cardNumber) {
 
   const bool evenOk = ((firstHalfOnes + bits[0]) % 2) == 0;
   const bool oddOk = ((secondHalfOnes + bits[33]) % 2) == 1;
-  if (!evenOk || !oddOk) {
-    return false;
-  }
-
-  cardNumber = bitsToUint32(bits, 1, 32);
-  return true;
+  return evenOk && oddOk;
 }
 
-bool decodeWiegandWithFallback(const uint8_t *bits, uint8_t bitCount, uint32_t& cardNumber) {
-  if (bitCount == WIEGAND_26_BITS) {
-    uint8_t facilityCode = 0;
-    uint16_t cardCode = 0;
+uint32_t bitsToUint32(const uint8_t *bits, uint8_t startInclusive, uint8_t endInclusive) {
+  uint32_t value = 0;
+  for (uint8_t i = startInclusive; i <= endInclusive; i++) {
+    value = (value << 1) | bits[i];
+  }
+  return value;
+}
 
-    const bool valid26 = decodeWiegand26(bits, cardNumber, facilityCode, cardCode);
-    if (!valid26) {
-      Serial.println("Invalid Wiegand-26 parity check");
-      return false;
+void printRawBits(const uint8_t *bits, uint8_t bitCount) {
+  Serial.print("Raw: ");
+  for (uint8_t i = 0; i < bitCount; i++) {
+    Serial.print(bits[i]);
+  }
+  Serial.println();
+}
+
+void printHex(const uint8_t *bits, uint8_t bitCount) {
+  uint8_t nibble = 0;
+  uint8_t nibbleBits = 0;
+
+  Serial.print("Hex: 0x");
+  for (uint8_t i = 0; i < bitCount; i++) {
+    nibble = (nibble << 1) | bits[i];
+    nibbleBits++;
+
+    if (nibbleBits == 4) {
+      Serial.print(nibble, HEX);
+      nibble = 0;
+      nibbleBits = 0;
     }
-
-    Serial.print("Wiegand-26 facility code: ");
-    Serial.print(facilityCode);
-    Serial.print(", card code: ");
-    Serial.println(cardCode);
-    return true;
   }
 
-  if (bitCount == WIEGAND_34_BITS) {
-    const bool valid34 = decodeWiegand34(bits, cardNumber);
-    if (!valid34) {
-      Serial.println("Invalid Wiegand-34 parity check");
-      return false;
-    }
-
-    Serial.println("Valid Wiegand-34 frame");
-    return true;
+  if (nibbleBits > 0) {
+    nibble <<= (4 - nibbleBits);
+    Serial.print(nibble, HEX);
   }
 
-  // Fallback for uncommon reader formats: keep data path alive.
-  if (bitCount == 32) {
-    cardNumber = bitsToUint32(bits, 0, 31);
-    Serial.println("Fallback decode: treating 32-bit frame as raw card ID");
-    return true;
-  }
+  Serial.println();
+}
 
-  if (bitCount > 2 && bitCount <= 34) {
-    cardNumber = bitsToUint32(bits, 1, bitCount - 2);
-
-    Serial.print("Fallback decode for ");
-    Serial.print(bitCount);
-    Serial.println("-bit frame (parity unchecked)");
-    return true;
-  }
-
-  Serial.print("Ignoring unsupported Wiegand frame length: ");
+void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
+  Serial.println();
+  Serial.println("=== Wiegand Frame ===");
+  Serial.print("Bit count: ");
   Serial.println(bitCount);
-  return false;
+  printRawBits(bits, bitCount);
+  printHex(bits, bitCount);
+
+  if (bitCount == 26) {
+    const uint16_t facilityCode = static_cast<uint16_t>(bitsToUint32(bits, 1, 8));
+    const uint16_t accessId = static_cast<uint16_t>(bitsToUint32(bits, 9, 24));
+    const bool parityOk = checkParity26(bits);
+
+    Serial.println("Format: 26-bit");
+    Serial.print("Facility code: ");
+    Serial.println(facilityCode);
+    Serial.print("Card number: ");
+    Serial.println(accessId);
+    Serial.print("Parity: ");
+    Serial.println(parityOk ? "OK" : "FAIL");
+
+    sendToServer(accessId);
+
+  } else if (bitCount == 34) {
+    const uint32_t accessId = bitsToUint32(bits, 1, 32);
+    const bool parityOk = checkParity34(bits);
+
+    Serial.println("Format: 34-bit");
+    Serial.print("Card number (32-bit payload): ");
+    Serial.println(accessId);
+    Serial.print("Parity: ");
+    Serial.println(parityOk ? "OK" : "FAIL");
+  } else {
+    Serial.println("Format: Unknown/Custom");
+  }
 }
 
-bool readWiegandCard(uint32_t& cardNumber, uint8_t& bitLength) {
-  static uint8_t localBits[WIEGAND_MAX_BITS];
-  uint8_t localCount = 0;
-  bool frameReady = false;
+/// end of Wiegand decoding logic //////
 
-  const uint32_t now = micros();
-  portENTER_CRITICAL(&WIEGAND_MUX);
-  if (WIEGAND_BIT_COUNT > 0 && (now - WIEGAND_LAST_BIT_US) > WIEGAND_FRAME_GAP_US) {
-    localCount = WIEGAND_BIT_COUNT;
-    for (uint8_t i = 0; i < localCount; i++) {
-      localBits[i] = WIEGAND_BIT_BUFFER[i];
-    }
-    WIEGAND_BIT_COUNT = 0;
-    WIEGAND_LAST_BIT_US = 0;
-    frameReady = true;
-  }
-  portEXIT_CRITICAL(&WIEGAND_MUX);
-
-  if (!frameReady) {
-    return false;
-  }
-
-  bitLength = localCount;
-  return decodeWiegandWithFallback(localBits, localCount, cardNumber);
-}
+/////////////// Main access control logic below ////////////
 
 void unlockMaglock() {
   digitalWrite(MAGLOCK_RELAY, HIGH);
@@ -259,13 +246,13 @@ void feedbackWiFiConnecting() {
   digitalWrite(LED_AUTHORIZED, HIGH);
 }
 
-void sendToServer(uint32_t cardNumber) {
+void sendToServer(uint32_t accessId) {
   if(WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.begin(apiUrl);
     http.addHeader("Content-Type", "application/json");
 
-    String payload = "{\"access_id\":\"" + String(cardNumber) + "\"}";
+    String payload = "{\"access_id\":\"" + String(accessId) + "\"}";
     feedbackProcessing();
     int httpResponseCode = http.POST(payload);
 
@@ -305,8 +292,8 @@ void setup(){
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onWiegandD0, FALLING);
-  attachInterrupt(digitalPinToInterrupt(WIEGAND_D1_PIN), onWiegandD1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onD0Pulse, FALLING);
+  attachInterrupt(digitalPinToInterrupt(WIEGAND_D1_PIN), onD1Pulse, FALLING);
 
   // Initialize serial
   Serial.begin(115200);
@@ -342,8 +329,8 @@ void setup(){
   // print wifi credentials for debugging
   Serial.print("Connecting to WiFi SSID: "); 
   Serial.println(ssid);
-  Serial.print("Password: ");
-  Serial.println(password);
+  // Serial.print("Password: ");
+  // Serial.println(password);
 
   // Try connecting
   Serial.print("Connecting to WiFi"); 
@@ -360,17 +347,37 @@ void setup(){
 
 }
 
-void loop(){
-  uint32_t cardNumber = 0;
-  uint8_t bitLength = 0;
-  if (readWiegandCard(cardNumber, bitLength)) {
-    CURRENT_LED_REJECTED_STATE = LOW;
+void readWiegandInput() {
+  static uint8_t localBits[MAX_WIEGAND_BITS];
+  uint8_t localCount = 0;
+  bool frameReady = false;
 
-    Serial.print("Valid Wiegand access ID (");
-    Serial.print(bitLength);
-    Serial.print("-bit): ");
-    Serial.println(cardNumber);
+  const uint32_t now = micros();
 
-    sendToServer(cardNumber);
+  portENTER_CRITICAL(&g_wiegandMux);
+  if (g_bitCount > 0 && (now - g_lastBitMicros) > FRAME_GAP_US) {
+    localCount = g_bitCount;
+    for (uint8_t i = 0; i < localCount; i++) {
+      localBits[i] = g_bitBuffer[i];
+    }
+    g_bitCount = 0;
+    g_lastBitMicros = 0;
+    frameReady = true;
   }
+  portEXIT_CRITICAL(&g_wiegandMux);
+
+  if (frameReady) {
+    decodeAndPrint(localBits, localCount);
+  }
+}
+
+void loop(){
+
+  readWiegandInput();
+
+  if (CURRENT_LED_REJECTED_STATE == LOW) {
+    digitalWrite(LED_REJECTED, HIGH);
+  }
+
+  delay(1);
 }
