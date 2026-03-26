@@ -10,6 +10,7 @@ const int LED_REJECTED = GPIO_NUM_13;
 const int LED_AUTHORIZED = GPIO_NUM_14;
 const int BUZZER = GPIO_NUM_25;
 const int MAGLOCK_RELAY = GPIO_NUM_26;
+const int EXIT_BUTTON_PIN = GPIO_NUM_18;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
@@ -175,7 +176,9 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
 
 void unlockMaglock() {
   digitalWrite(MAGLOCK_RELAY, HIGH);
-  delay(5000);
+}
+
+void lockMaglock() {
   digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
@@ -196,13 +199,17 @@ void grant() {
   // turn on authorized LED
   digitalWrite(LED_AUTHORIZED, HIGH);
 
+  // unlock the maglock for preset time before locking again
+  unlockMaglock();
+
   // sound buzzer
   digitalWrite(BUZZER, HIGH);
   delay(1000);
   digitalWrite(BUZZER, LOW);
 
-  // unlock the maglock for preset time before locking again
-  unlockMaglock();
+  // lock the maglock again after delay
+  delay(4000);
+  lockMaglock();
 
   // turn off authorized LED
   digitalWrite(LED_AUTHORIZED, LOW);
@@ -244,6 +251,30 @@ void feedbackWiFiConnecting() {
   digitalWrite(LED_PROCESSING, HIGH);
   digitalWrite(LED_REJECTED, HIGH);
   digitalWrite(LED_AUTHORIZED, HIGH);
+}
+
+void handleExitButtonPress() {
+  static int lastReading = HIGH;
+  static int stableState = HIGH;
+  static unsigned long lastDebounceTimeMs = 0;
+  const unsigned long debounceDelayMs = 40;
+
+  const int reading = digitalRead(EXIT_BUTTON_PIN);
+
+  if (reading != lastReading) {
+    lastDebounceTimeMs = millis();
+    lastReading = reading;
+  }
+
+  if ((millis() - lastDebounceTimeMs) > debounceDelayMs && reading != stableState) {
+    stableState = reading;
+
+    // Active-low button on INPUT_PULLUP: LOW means button pressed.
+    if (stableState == LOW) {
+      Serial.println("Exit button pressed. Granting egress access.");
+      grant();
+    }
+  }
 }
 
 void sendToServer(uint32_t accessId) {
@@ -289,6 +320,7 @@ void setup(){
   pinMode(LED_AUTHORIZED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(MAGLOCK_RELAY, OUTPUT);
+  pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
@@ -373,6 +405,7 @@ void readWiegandInput() {
 
 void loop(){
 
+  handleExitButtonPress();
   readWiegandInput();
 
   if (CURRENT_LED_REJECTED_STATE == LOW) {
