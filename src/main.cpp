@@ -9,10 +9,16 @@ const int LED_PROCESSING = GPIO_NUM_12;
 const int LED_REJECTED = GPIO_NUM_13;
 const int LED_AUTHORIZED = GPIO_NUM_14;
 const int BUZZER = GPIO_NUM_25;
-const int MAGLOCK_RELAY = GPIO_NUM_26;
-const int EXIT_BUTTON_PIN = GPIO_NUM_18;
+const int MAGLOCK_RELAY = GPIO_NUM_18;
+const int EXIT_BUTTON_PIN = GPIO_NUM_32;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
+
+// control device changeover pins
+const int MAGLOCK_PWR_VCC_RALAY = GPIO_NUM_19; 
+const int MAGLOCK_PWR_GND_RALAY = GPIO_NUM_21;
+const int EXIT_BUTTON_INPUT_PULLUP_RELAY = GPIO_NUM_22;
+const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_23;
 
 int short CURRENT_LED_REJECTED_STATE = LOW;
 
@@ -24,6 +30,29 @@ const char* password = WIFI_PASSWORD;
 const char* apiUrl = API_URL;
 
 void sendToServer(uint32_t accessId);
+
+////// CHANGEOVER CONTROL LOGIC BELOW //////////
+void changeoverControlTo(const char *str) {
+  if (strcmp(str, "THIS_DEVICE") == 0) {
+    // Connect maglock power to this device and exit button input to this device
+    // Energize all control relays to switch connections
+    digitalWrite(MAGLOCK_PWR_VCC_RALAY, HIGH);
+    digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
+    digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
+    Serial.println("Switched control to THIS_DEVICE");
+  } else if (strcmp(str, "EXTERNAL_CONTROLLER") == 0) {
+    // Connect maglock power to external controller and exit button input to external controller
+    // De-energize all control relays to switch connections
+    digitalWrite(MAGLOCK_PWR_VCC_RALAY, LOW);
+    digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
+    digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, LOW);
+    digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, LOW);
+    Serial.println("Switched control to EXTERNAL_CONTROLLER");
+  } else {
+    Serial.println("Invalid changeover target specified");
+  }
+}
 
 ////////////////// Wiegand decoding logic below ///
 
@@ -308,7 +337,8 @@ void sendToServer(uint32_t accessId) {
     http.end();
   } else {
     Serial.println("WiFi not connected");
-    feedbackReject();
+    // handover control back to external controller on WiFi failure
+    changeoverControlTo("EXTERNAL_CONTROLLER");
   }
 }
 
@@ -323,6 +353,13 @@ void setup(){
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
+
+  // Set changeover control pins to OUTPUT and initialize to default state (connected to external controller) 
+  pinMode(MAGLOCK_PWR_VCC_RALAY, OUTPUT);
+  pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
+  pinMode(EXIT_BUTTON_INPUT_PULLUP_RELAY, OUTPUT);
+  pinMode(EXIT_BUTTON_INPUT_GND_RELAY, OUTPUT);
+  changeoverControlTo("EXTERNAL_CONTROLLER");
 
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onD0Pulse, FALLING);
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D1_PIN), onD1Pulse, FALLING);
@@ -354,8 +391,7 @@ void setup(){
   delay(1000); 
   digitalWrite(MAGLOCK_RELAY, LOW);
 
- // connect to WiFi
-
+ // connect to WiFi with feedback
   feedbackWiFiConnecting();
 
   // print wifi credentials for debugging
@@ -373,6 +409,12 @@ void setup(){
   }
   Serial.println("");
   Serial.println("WiFi connected");
+  // take note of IP address for debugging
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // takeover control of maglock power and exit button input from external controller on successful WiFi connection
+  changeoverControlTo("THIS_DEVICE");
 
   // reset feedback after successful WiFi connection
   feedbackReset(); 
