@@ -29,6 +29,8 @@ void unlockMaglock() {
 }
 
 void feedbackProcessing() {
+  digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(LED_PROCESSING, HIGH);
 }
 
@@ -55,13 +57,25 @@ void grant() {
   digitalWrite(LED_AUTHORIZED, LOW);
 }
 
-void feedbackReject() {
+void feedbackReject(bool idle = false) {
   // provide feedback for rejected access
   digitalWrite(LED_PROCESSING, LOW);
   digitalWrite(LED_REJECTED, HIGH);
-  tone(BUZZER, 500, 1000); // longer low beep
 
   CURRENT_LED_REJECTED_STATE = HIGH;
+
+  if (idle) {
+    return; // if idle is true, only update LEDs without sounding buzzer
+  }
+
+  // sound buzzer with a pattern for rejected access
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(BUZZER, HIGH);
+    delay(80);                      
+    digitalWrite(BUZZER, LOW);
+    delay(80);
+  }
+
 }
 
 void feedbackReset() {
@@ -69,7 +83,7 @@ void feedbackReset() {
   digitalWrite(LED_PROCESSING, LOW);
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
-  noTone(BUZZER);
+  digitalWrite(BUZZER, LOW);
 
   CURRENT_LED_REJECTED_STATE = LOW;
 }
@@ -87,7 +101,7 @@ void sendToServer(uint32_t cardNumber) {
     http.begin(apiUrl);
     http.addHeader("Content-Type", "application/json");
 
-    String payload = "{\"ma300_id\":\"" + String(cardNumber) + "\"}";
+    String payload = "{\"access_id\":\"" + String(cardNumber) + "\"}";
     feedbackProcessing();
     int httpResponseCode = http.POST(payload);
 
@@ -95,9 +109,14 @@ void sendToServer(uint32_t cardNumber) {
       String response = http.getString();
       Serial.println("Server response: " + response);
 
-      if(response.indexOf("\"access\":\"GRANT\"") >= 0) {
+      // parse {"access": "GRANT"}
+
+
+      if(response.indexOf("\"access\": \"GRANT\"") >= 0) {
+        Serial.println("Access granted by server");
         grant();
       } else {
+        Serial.println("Access denied by server");
         feedbackReject();
       }
     } else {
@@ -136,12 +155,12 @@ void setup(){
   digitalWrite(MAGLOCK_RELAY, LOW);
 
   // test all outputs by turning them on for 1 second
-  digitalWrite(LED_PROCESSING, HIGH);
-  delay(1000);
-  digitalWrite(LED_PROCESSING, LOW);
   digitalWrite(LED_REJECTED, HIGH);
   delay(1000);
   digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_PROCESSING, HIGH);
+  delay(1000);
+  digitalWrite(LED_PROCESSING, LOW);
   digitalWrite(LED_AUTHORIZED, HIGH);
   delay(1000);
   digitalWrite(LED_AUTHORIZED, LOW);
@@ -203,7 +222,7 @@ void loop(){
     if (CURRENT_LED_REJECTED_STATE == LOW) {
 
       Serial.println("Unauthorized access attempt detected!");
-      feedbackReject();
+      feedbackReject(true); // pass true to only update LEDs without sounding buzzer for repeated attempts
 
       CURRENT_LED_REJECTED_STATE = HIGH;
     }
