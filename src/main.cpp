@@ -11,6 +11,7 @@ const int LED_AUTHORIZED = GPIO_NUM_14;
 const int BUZZER = GPIO_NUM_25;
 const int MAGLOCK_RELAY = GPIO_NUM_18;
 const int EXIT_BUTTON_PIN = GPIO_NUM_32;
+const int TAMPER_SWITCH_PIN = GPIO_NUM_26;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
@@ -306,6 +307,48 @@ void handleExitButtonPress() {
   }
 }
 
+void handleTamperSwitch() {
+  static int lastReading = LOW;
+  static int stableState = LOW;
+  static unsigned long lastDebounceTimeMs = 0;
+  static bool tamperAlarmActive = false;
+  static bool buzzerState = false;
+  static unsigned long lastBuzzerToggleMs = 0;
+  const unsigned long debounceDelayMs = 40;
+  const unsigned long buzzerToggleIntervalMs = 80;
+
+  const int reading = digitalRead(TAMPER_SWITCH_PIN);
+
+  if (reading != lastReading) {
+    lastDebounceTimeMs = millis();
+    lastReading = reading;
+  }
+
+  if ((millis() - lastDebounceTimeMs) > debounceDelayMs && reading != stableState) {
+    stableState = reading;
+
+    // Normally-closed tamper on INPUT_PULLUP: HIGH means contact opened.
+    if (stableState == HIGH) {
+      Serial.println("Tamper switch opened. Starting buzzer alarm.");
+      tamperAlarmActive = true;
+      buzzerState = true;
+      lastBuzzerToggleMs = millis();
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      Serial.println("Tamper switch restored. Stopping buzzer alarm.");
+      tamperAlarmActive = false;
+      buzzerState = false;
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+
+  if (tamperAlarmActive && (millis() - lastBuzzerToggleMs) >= buzzerToggleIntervalMs) {
+    buzzerState = !buzzerState;
+    lastBuzzerToggleMs = millis();
+    digitalWrite(BUZZER, buzzerState ? HIGH : LOW);
+  }
+}
+
 void sendToServer(uint32_t accessId) {
   if(WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -351,6 +394,7 @@ void setup(){
   pinMode(BUZZER, OUTPUT);
   pinMode(MAGLOCK_RELAY, OUTPUT);
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TAMPER_SWITCH_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
@@ -448,6 +492,7 @@ void readWiegandInput() {
 void loop(){
 
   handleExitButtonPress();
+  handleTamperSwitch();
   readWiegandInput();
 
   if (CURRENT_LED_REJECTED_STATE == LOW) {
