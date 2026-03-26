@@ -208,7 +208,7 @@ void grant() {
   digitalWrite(BUZZER, LOW);
 
   // lock the maglock again after delay
-  delay(5000);
+  delay(4000);
   lockMaglock();
 
   // turn off authorized LED
