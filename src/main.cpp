@@ -32,13 +32,16 @@ const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
+const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
+
 Preferences g_preferences;
 WebServer g_webServer(80);
 
 String g_wifiSsid;
 String g_wifiPassword;
-String g_apiUrl;
 String g_apiKey;
+String g_configApPassword;
+String g_configWebPassword;
 bool g_tamperEnabled = true;
 bool g_configModeActive = false;
 unsigned long g_configModeLastActivityMs = 0;
@@ -103,13 +106,18 @@ void loadRuntimeConfig() {
   g_preferences.begin("accesscfg", true);
   g_wifiSsid = g_preferences.getString("ssid", WIFI_SSID);
   g_wifiPassword = g_preferences.getString("pass", WIFI_PASSWORD);
-  g_apiUrl = g_preferences.getString("api_url", API_URL);
   g_apiKey = g_preferences.getString("api_key", "");
+  g_configApPassword = g_preferences.getString("ap_pass", CONFIG_AP_PASSWORD_DEFAULT);
+  g_configWebPassword = g_preferences.getString("web_pass", CONFIG_WEB_PASSWORD_DEFAULT);
   g_tamperEnabled = g_preferences.getBool("tamper_en", true);
   g_preferences.end();
 
-  if (g_apiUrl.length() == 0) {
-    g_apiUrl = API_URL;
+  if (g_configApPassword.length() < 8 || g_configApPassword.length() > 63) {
+    g_configApPassword = CONFIG_AP_PASSWORD_DEFAULT;
+  }
+
+  if (g_configWebPassword.length() < 4 || g_configWebPassword.length() > 63) {
+    g_configWebPassword = CONFIG_WEB_PASSWORD_DEFAULT;
   }
 }
 
@@ -117,8 +125,9 @@ void saveRuntimeConfig() {
   g_preferences.begin("accesscfg", false);
   g_preferences.putString("ssid", g_wifiSsid);
   g_preferences.putString("pass", g_wifiPassword);
-  g_preferences.putString("api_url", g_apiUrl);
   g_preferences.putString("api_key", g_apiKey);
+  g_preferences.putString("ap_pass", g_configApPassword);
+  g_preferences.putString("web_pass", g_configWebPassword);
   g_preferences.putBool("tamper_en", g_tamperEnabled);
   g_preferences.end();
 }
@@ -140,7 +149,8 @@ String buildConfigPageHtml(const String &message) {
     "<form method='POST' action='/save'>"
     "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(g_wifiSsid) + "' required>"
     "<label>WiFi Password</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
-    "<label>API URL</label><input name='api_url' value='" + htmlEscape(g_apiUrl) + "' required>"
+    "<label>Setup AP Password (8-63 chars)</label><input type='password' name='ap_password' value='" + htmlEscape(g_configApPassword) + "' minlength='8' maxlength='63' required>"
+    "<label>Setup Page Password (4-63 chars)</label><input type='password' name='web_password' value='" + htmlEscape(g_configWebPassword) + "' minlength='4' maxlength='63' required>"
     "<label>API Key</label><input name='api_key' value='" + htmlEscape(g_apiKey) + "'>"
     "<div class='row'><input id='tamper' type='checkbox' name='tamper_enabled' " + checked + ">"
     "<label for='tamper' style='margin:0;font-weight:400;'>Enable tamper detection</label><span>Enable tamper detection</span></div>"
@@ -151,18 +161,40 @@ String buildConfigPageHtml(const String &message) {
 
 void configureWebRoutes() {
   g_webServer.on("/", HTTP_GET, []() {
+    if (!g_webServer.authenticate(CONFIG_WEB_USERNAME, g_configWebPassword.c_str())) {
+      return g_webServer.requestAuthentication();
+    }
+
     g_configModeLastActivityMs = millis();
     g_webServer.send(200, "text/html", buildConfigPageHtml(""));
   });
 
   g_webServer.on("/save", HTTP_POST, []() {
+    if (!g_webServer.authenticate(CONFIG_WEB_USERNAME, g_configWebPassword.c_str())) {
+      return g_webServer.requestAuthentication();
+    }
+
     g_configModeLastActivityMs = millis();
 
     g_wifiSsid = g_webServer.arg("ssid");
     g_wifiPassword = g_webServer.arg("password");
-    g_apiUrl = g_webServer.arg("api_url");
     g_apiKey = g_webServer.arg("api_key");
+    const String requestedApPassword = g_webServer.arg("ap_password");
+    const String requestedWebPassword = g_webServer.arg("web_password");
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
+
+    if (requestedApPassword.length() < 8 || requestedApPassword.length() > 63) {
+      g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
+      return;
+    }
+
+    if (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63) {
+      g_webServer.send(400, "text/html", buildConfigPageHtml("Page password must be 4 to 63 characters."));
+      return;
+    }
+
+    g_configApPassword = requestedApPassword;
+    g_configWebPassword = requestedWebPassword;
 
     saveRuntimeConfig();
     g_webServer.send(200, "text/html", buildConfigPageHtml("Saved successfully. Leaving setup mode now."));
@@ -239,10 +271,11 @@ void startConfigMode() {
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_AP);
 
-  const String apSsid = "AccessController-Setup";
-  WiFi.softAP(apSsid.c_str());
+  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, g_configApPassword.c_str());
   Serial.print("Setup AP SSID: ");
-  Serial.println(apSsid);
+  Serial.println(CONFIG_AP_SSID);
+  Serial.print("Setup AP protected: ");
+  Serial.println(apStarted ? "YES" : "FAILED");
   Serial.print("Setup portal IP: ");
   Serial.println(WiFi.softAPIP());
 
@@ -644,7 +677,7 @@ void handleTamperSwitch() {
 void sendToServer(uint32_t accessId) {
   if(WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(g_apiUrl);
+    http.begin(API_URL);
     http.addHeader("Content-Type", "application/json");
     if (g_apiKey.length() > 0) {
       http.addHeader("X-API-Key", g_apiKey);
