@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 #include "secrets.h"
 
@@ -10,7 +12,9 @@ const int LED_REJECTED = GPIO_NUM_13;
 const int LED_AUTHORIZED = GPIO_NUM_14;
 const int BUZZER = GPIO_NUM_25;
 const int MAGLOCK_RELAY = GPIO_NUM_18;
-const int EXIT_BUTTON_PIN = GPIO_NUM_32;
+const int EXIT_BUTTON_PIN = GPIO_NUM_27;
+const int CONFIG_BUTTON_PIN = GPIO_NUM_4;
+const int TAMPER_SWITCH_PIN = GPIO_NUM_26;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
@@ -22,14 +26,44 @@ const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_23;
 
 int short CURRENT_LED_REJECTED_STATE = LOW;
 
-// WiFi credentials
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
+const unsigned long BUTTON_LONG_PRESS_MS = 5000;
+const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
+const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
+const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
-// Backend API endpoint
-const char* apiUrl = API_URL;
+const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
+
+Preferences g_preferences;
+WebServer g_webServer(80);
+
+String g_wifiSsid;
+String g_wifiPassword;
+String g_apiKey;
+String g_configApPassword;
+String g_configWebPassword;
+bool g_tamperEnabled = true;
+bool g_configModeActive = false;
+unsigned long g_configModeLastActivityMs = 0;
+bool g_webRoutesConfigured = false;
+bool g_exitConfigModeRequested = false;
+
+bool g_tamperAlarmActive = false;
+bool g_tamperBuzzerState = false;
+unsigned long g_lastTamperToggleMs = 0;
+bool g_configLedBlinkState = false;
+unsigned long g_lastConfigLedBlinkMs = 0;
 
 void sendToServer(uint32_t accessId);
+void startConfigMode();
+void stopConfigMode();
+bool connectToConfiguredWiFi();
+void lockMaglock();
+void feedbackWiFiConnecting();
+void feedbackReject(bool idle);
+void feedbackReset();
+void handleConfigButtonLongPress();
+void updateConfigModeIndicators();
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -40,6 +74,7 @@ void changeoverControlTo(const char *str) {
     digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
+    // Return LED control to normal runtime feedback flow.
     Serial.println("Switched control to THIS_DEVICE");
   } else if (strcmp(str, "EXTERNAL_CONTROLLER") == 0) {
     // Connect maglock power to external controller and exit button input to external controller
@@ -48,10 +83,226 @@ void changeoverControlTo(const char *str) {
     digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, LOW);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, LOW);
+    // External control indicator: processing and authorized LEDs ON.
+    digitalWrite(LED_PROCESSING, HIGH);
+    digitalWrite(LED_AUTHORIZED, HIGH);
     Serial.println("Switched control to EXTERNAL_CONTROLLER");
   } else {
     Serial.println("Invalid changeover target specified");
   }
+}
+
+String htmlEscape(const String &value) {
+  String escaped = value;
+  escaped.replace("&", "&amp;");
+  escaped.replace("<", "&lt;");
+  escaped.replace(">", "&gt;");
+  escaped.replace("\"", "&quot;");
+  escaped.replace("'", "&#39;");
+  return escaped;
+}
+
+void loadRuntimeConfig() {
+  g_preferences.begin("accesscfg", true);
+  g_wifiSsid = g_preferences.getString("ssid", WIFI_SSID);
+  g_wifiPassword = g_preferences.getString("pass", WIFI_PASSWORD);
+  g_apiKey = g_preferences.getString("api_key", "");
+  g_configApPassword = g_preferences.getString("ap_pass", CONFIG_AP_PASSWORD_DEFAULT);
+  g_configWebPassword = g_preferences.getString("web_pass", CONFIG_WEB_PASSWORD_DEFAULT);
+  g_tamperEnabled = g_preferences.getBool("tamper_en", true);
+  g_preferences.end();
+
+  if (g_configApPassword.length() < 8 || g_configApPassword.length() > 63) {
+    g_configApPassword = CONFIG_AP_PASSWORD_DEFAULT;
+  }
+
+  if (g_configWebPassword.length() < 4 || g_configWebPassword.length() > 63) {
+    g_configWebPassword = CONFIG_WEB_PASSWORD_DEFAULT;
+  }
+}
+
+void saveRuntimeConfig() {
+  g_preferences.begin("accesscfg", false);
+  g_preferences.putString("ssid", g_wifiSsid);
+  g_preferences.putString("pass", g_wifiPassword);
+  g_preferences.putString("api_key", g_apiKey);
+  g_preferences.putString("ap_pass", g_configApPassword);
+  g_preferences.putString("web_pass", g_configWebPassword);
+  g_preferences.putBool("tamper_en", g_tamperEnabled);
+  g_preferences.end();
+}
+
+String buildConfigPageHtml(const String &message) {
+  const String checked = g_tamperEnabled ? "checked" : "";
+  const String html =
+    "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Access Controller Setup</title>"
+    "<style>body{font-family:sans-serif;max-width:520px;margin:20px auto;padding:0 12px;}"
+    "label{display:block;margin-top:12px;font-weight:600;}"
+    "input{width:100%;padding:10px;box-sizing:border-box;}"
+    "button{margin-top:16px;padding:10px 14px;}"
+    ".msg{padding:10px;background:#eef7ee;border:1px solid #b9deb9;margin:12px 0;}"
+    ".row{margin-top:12px;display:flex;align-items:center;gap:10px;}</style></head><body>"
+    "<h2>Access Controller Setup</h2>"
+    "<p>Device is in setup mode. It returns to normal mode after idle timeout.</p>" +
+    (message.length() ? ("<div class='msg'>" + htmlEscape(message) + "</div>") : String("")) +
+    "<form method='POST' action='/save'>"
+    "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(g_wifiSsid) + "' required>"
+    "<label>WiFi Password</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
+    "<label>Setup AP Password (8-63 chars)</label><input type='password' name='ap_password' value='" + htmlEscape(g_configApPassword) + "' minlength='8' maxlength='63' required>"
+    "<label>Setup Page Password (4-63 chars)</label><input type='password' name='web_password' value='" + htmlEscape(g_configWebPassword) + "' minlength='4' maxlength='63' required>"
+    "<label>API Key</label><input name='api_key' value='" + htmlEscape(g_apiKey) + "'>"
+    "<div class='row'><input id='tamper' type='checkbox' name='tamper_enabled' " + checked + ">"
+    "<label for='tamper' style='margin:0;font-weight:400;'>Enable tamper detection</label><span>Enable tamper detection</span></div>"
+    "<button type='submit'>Save</button></form></body></html>";
+
+  return html;
+}
+
+void configureWebRoutes() {
+  g_webServer.on("/", HTTP_GET, []() {
+    if (!g_webServer.authenticate(CONFIG_WEB_USERNAME, g_configWebPassword.c_str())) {
+      return g_webServer.requestAuthentication();
+    }
+
+    g_configModeLastActivityMs = millis();
+    g_webServer.send(200, "text/html", buildConfigPageHtml(""));
+  });
+
+  g_webServer.on("/save", HTTP_POST, []() {
+    if (!g_webServer.authenticate(CONFIG_WEB_USERNAME, g_configWebPassword.c_str())) {
+      return g_webServer.requestAuthentication();
+    }
+
+    g_configModeLastActivityMs = millis();
+
+    g_wifiSsid = g_webServer.arg("ssid");
+    g_wifiPassword = g_webServer.arg("password");
+    g_apiKey = g_webServer.arg("api_key");
+    const String requestedApPassword = g_webServer.arg("ap_password");
+    const String requestedWebPassword = g_webServer.arg("web_password");
+    g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
+
+    if (requestedApPassword.length() < 8 || requestedApPassword.length() > 63) {
+      g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
+      return;
+    }
+
+    if (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63) {
+      g_webServer.send(400, "text/html", buildConfigPageHtml("Page password must be 4 to 63 characters."));
+      return;
+    }
+
+    g_configApPassword = requestedApPassword;
+    g_configWebPassword = requestedWebPassword;
+
+    saveRuntimeConfig();
+    g_webServer.send(200, "text/html", buildConfigPageHtml("Saved successfully. Leaving setup mode now."));
+    g_exitConfigModeRequested = true;
+  });
+}
+
+bool connectToConfiguredWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(100);
+
+  // Blink LED_PROCESSING only during connection; all others off.
+  digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
+
+  Serial.print("Connecting to WiFi SSID: ");
+  Serial.println(g_wifiSsid);
+  Serial.print("Connecting to WiFi");
+
+  WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+
+  bool ledBlinkState = false;
+  const unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_CONNECT_TIMEOUT_MS) {
+    ledBlinkState = !ledBlinkState;
+    digitalWrite(LED_PROCESSING, ledBlinkState ? HIGH : LOW);
+    delay(500);
+    Serial.print(".");
+  }
+  digitalWrite(LED_PROCESSING, LOW);
+
+  Serial.println("");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    changeoverControlTo("THIS_DEVICE");
+
+    // On successful connection, keep only rejected LED ON.
+    digitalWrite(LED_PROCESSING, LOW);
+    digitalWrite(LED_AUTHORIZED, LOW);
+    digitalWrite(LED_REJECTED, HIGH);
+    CURRENT_LED_REJECTED_STATE = LOW;
+    return true;
+  }
+
+  Serial.println("WiFi connection failed within timeout");
+  changeoverControlTo("EXTERNAL_CONTROLLER");
+
+  // On connection failure, show external-control style LEDs.
+  digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_PROCESSING, HIGH);
+  digitalWrite(LED_AUTHORIZED, HIGH);
+  CURRENT_LED_REJECTED_STATE = LOW;
+  return false;
+}
+
+void startConfigMode() {
+  if (g_configModeActive) {
+    return;
+  }
+
+  Serial.println("Entering setup mode via long button press");
+  g_configModeActive = true;
+  g_exitConfigModeRequested = false;
+  g_configModeLastActivityMs = millis();
+  g_lastConfigLedBlinkMs = millis();
+  g_configLedBlinkState = false;
+
+  lockMaglock();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_AP);
+
+  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, g_configApPassword.c_str());
+  Serial.print("Setup AP SSID: ");
+  Serial.println(CONFIG_AP_SSID);
+  Serial.print("Setup AP protected: ");
+  Serial.println(apStarted ? "YES" : "FAILED");
+  Serial.print("Setup portal IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (!g_webRoutesConfigured) {
+    configureWebRoutes();
+    g_webRoutesConfigured = true;
+  }
+  g_webServer.begin();
+}
+
+void stopConfigMode() {
+  if (!g_configModeActive) {
+    return;
+  }
+
+  Serial.println("Leaving setup mode");
+  g_webServer.stop();
+  WiFi.softAPdisconnect(true);
+  g_configModeActive = false;
+  g_exitConfigModeRequested = false;
+
+  // Leaving setup mode: clear all feedback LEDs before reconnection feedback.
+  digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
+
+  connectToConfiguredWiFi();
 }
 
 ////////////////// Wiegand decoding logic below ///
@@ -277,9 +528,9 @@ void feedbackReset() {
 
 void feedbackWiFiConnecting() {
   // provide feedback for WiFi connection in progress
-  digitalWrite(LED_PROCESSING, HIGH);
-  digitalWrite(LED_REJECTED, HIGH);
-  digitalWrite(LED_AUTHORIZED, HIGH);
+  digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_REJECTED, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
 }
 
 void handleExitButtonPress() {
@@ -306,11 +557,131 @@ void handleExitButtonPress() {
   }
 }
 
+void handleConfigButtonLongPress() {
+  static int lastReading = HIGH;
+  static int stableState = HIGH;
+  static unsigned long lastDebounceTimeMs = 0;
+  static unsigned long pressedStartMs = 0;
+  static bool longPressHandled = false;
+  static unsigned long releasedAtMs = 0;
+  static unsigned long pressDurationOnRelease = 0;
+  const unsigned long debounceDelayMs = 40;
+
+  const int reading = digitalRead(CONFIG_BUTTON_PIN);
+
+  if (reading != lastReading) {
+    lastDebounceTimeMs = millis();
+    lastReading = reading;
+  }
+
+  if ((millis() - lastDebounceTimeMs) > debounceDelayMs && reading != stableState) {
+    stableState = reading;
+
+    if (stableState == LOW) {
+      pressedStartMs = millis();
+      longPressHandled = false;
+      pressDurationOnRelease = 0;
+    } else {
+      // Button released: capture duration for short-press detection.
+      pressDurationOnRelease = millis() - pressedStartMs;
+      releasedAtMs = millis();
+    }
+  }
+
+  const unsigned long pressDurationMs = millis() - pressedStartMs;
+
+  // 1-second press on release: reconnect WiFi if not in config mode and not connected.
+  if (stableState == HIGH && !longPressHandled && !g_configModeActive
+      && pressDurationOnRelease >= CONFIG_RECONNECT_PRESS_MS
+      && pressDurationOnRelease < BUTTON_LONG_PRESS_MS
+      && (millis() - releasedAtMs) < 200) {
+    pressDurationOnRelease = 0;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Config button 1s press: reconnecting to WiFi.");
+      connectToConfiguredWiFi();
+    } else {
+      Serial.println("Config button 1s press: WiFi already connected, ignoring.");
+      changeoverControlTo("THIS_DEVICE"); // ensure control is with this device if already connected
+    }
+  }
+
+  // Active-low button on INPUT_PULLUP: LOW means button pressed.
+  if (stableState == LOW && !longPressHandled && !g_configModeActive && pressDurationMs >= BUTTON_LONG_PRESS_MS) {
+    longPressHandled = true;
+    startConfigMode();
+  }
+
+  if (stableState == LOW && !longPressHandled && g_configModeActive && pressDurationMs >= CONFIG_EXIT_LONG_PRESS_MS) {
+    longPressHandled = true;
+    Serial.println("Config button long press detected. Leaving setup mode.");
+    g_exitConfigModeRequested = true;
+  }
+}
+
+void updateConfigModeIndicators() {
+  const unsigned long blinkIntervalMs = 800;
+  if ((millis() - g_lastConfigLedBlinkMs) >= blinkIntervalMs) {
+    g_lastConfigLedBlinkMs = millis();
+    g_configLedBlinkState = !g_configLedBlinkState;
+    digitalWrite(LED_PROCESSING, g_configLedBlinkState ? HIGH : LOW);
+    digitalWrite(LED_AUTHORIZED, g_configLedBlinkState ? HIGH : LOW);
+  }
+}
+
+void handleTamperSwitch() {
+  static int lastReading = LOW;
+  static int stableState = LOW;
+  static unsigned long lastDebounceTimeMs = 0;
+  const unsigned long debounceDelayMs = 40;
+  const unsigned long buzzerToggleIntervalMs = 80;
+
+  if (!g_tamperEnabled) {
+    g_tamperAlarmActive = false;
+    g_tamperBuzzerState = false;
+    digitalWrite(BUZZER, LOW);
+    return;
+  }
+
+  const int reading = digitalRead(TAMPER_SWITCH_PIN);
+
+  if (reading != lastReading) {
+    lastDebounceTimeMs = millis();
+    lastReading = reading;
+  }
+
+  if ((millis() - lastDebounceTimeMs) > debounceDelayMs && reading != stableState) {
+    stableState = reading;
+
+    // Normally-closed tamper on INPUT_PULLUP: HIGH means contact opened.
+    if (stableState == HIGH) {
+      Serial.println("Tamper switch opened. Starting buzzer alarm.");
+      g_tamperAlarmActive = true;
+      g_tamperBuzzerState = true;
+      g_lastTamperToggleMs = millis();
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      Serial.println("Tamper switch restored. Stopping buzzer alarm.");
+      g_tamperAlarmActive = false;
+      g_tamperBuzzerState = false;
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+
+  if (g_tamperAlarmActive && (millis() - g_lastTamperToggleMs) >= buzzerToggleIntervalMs) {
+    g_tamperBuzzerState = !g_tamperBuzzerState;
+    g_lastTamperToggleMs = millis();
+    digitalWrite(BUZZER, g_tamperBuzzerState ? HIGH : LOW);
+  }
+}
+
 void sendToServer(uint32_t accessId) {
   if(WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(apiUrl);
+    http.begin(API_URL);
     http.addHeader("Content-Type", "application/json");
+    if (g_apiKey.length() > 0) {
+      http.addHeader("X-API-Key", g_apiKey);
+    }
 
     String payload = "{\"access_id\":\"" + String(accessId) + "\"}";
     feedbackProcessing();
@@ -351,6 +722,8 @@ void setup(){
   pinMode(BUZZER, OUTPUT);
   pinMode(MAGLOCK_RELAY, OUTPUT);
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(TAMPER_SWITCH_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
@@ -366,6 +739,8 @@ void setup(){
 
   // Initialize serial
   Serial.begin(115200);
+
+  loadRuntimeConfig();
 
   // Initialize all LEDs and buzzer to LOW
   digitalWrite(LED_PROCESSING, LOW);
@@ -391,33 +766,7 @@ void setup(){
   delay(1000); 
   digitalWrite(MAGLOCK_RELAY, LOW);
 
- // connect to WiFi with feedback
-  feedbackWiFiConnecting();
-
-  // print wifi credentials for debugging
-  Serial.print("Connecting to WiFi SSID: "); 
-  Serial.println(ssid);
-  // Serial.print("Password: ");
-  // Serial.println(password);
-
-  // Try connecting
-  Serial.print("Connecting to WiFi"); 
-  WiFi.begin(ssid, password);
-  while(WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  // take note of IP address for debugging
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  // takeover control of maglock power and exit button input from external controller on successful WiFi connection
-  changeoverControlTo("THIS_DEVICE");
-
-  // reset feedback after successful WiFi connection
-  feedbackReset(); 
+  connectToConfiguredWiFi();
 
 }
 
@@ -448,9 +797,30 @@ void readWiegandInput() {
 void loop(){
 
   handleExitButtonPress();
+  handleConfigButtonLongPress();
+
+  if (g_configModeActive) {
+    updateConfigModeIndicators();
+    g_webServer.handleClient();
+
+    if (g_exitConfigModeRequested) {
+      stopConfigMode();
+      delay(2);
+      return;
+    }
+
+    if ((millis() - g_configModeLastActivityMs) >= CONFIG_MODE_IDLE_TIMEOUT_MS) {
+      stopConfigMode();
+    }
+
+    delay(2);
+    return;
+  }
+
+  handleTamperSwitch();
   readWiegandInput();
 
-  if (CURRENT_LED_REJECTED_STATE == LOW) {
+  if (CURRENT_LED_REJECTED_STATE == LOW && WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_REJECTED, HIGH);
   }
 
