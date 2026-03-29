@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <map>
 
 #include "secrets.h"
 
@@ -20,9 +21,9 @@ const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
 // control device changeover pins
 const int MAGLOCK_PWR_VCC_RALAY = GPIO_NUM_19; 
-const int MAGLOCK_PWR_GND_RALAY = GPIO_NUM_21;
-const int EXIT_BUTTON_INPUT_PULLUP_RELAY = GPIO_NUM_22;
-const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_23;
+const int MAGLOCK_PWR_GND_RALAY = GPIO_NUM_23;
+const int EXIT_BUTTON_INPUT_PULLUP_RELAY = GPIO_NUM_21;
+const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_22;
 
 int short CURRENT_LED_REJECTED_STATE = LOW;
 
@@ -31,6 +32,7 @@ const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 300000UL; // 5 minutes
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -54,6 +56,9 @@ unsigned long g_lastTamperToggleMs = 0;
 bool g_configLedBlinkState = false;
 unsigned long g_lastConfigLedBlinkMs = 0;
 
+std::map<uint32_t, bool> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
+unsigned long g_lastMappingsFetchMs = 0;
+
 void sendToServer(uint32_t accessId);
 void startConfigMode();
 void stopConfigMode();
@@ -64,6 +69,7 @@ void feedbackReject(bool idle);
 void feedbackReset();
 void handleConfigButtonLongPress();
 void updateConfigModeIndicators();
+void fetchAccessMappings();
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -102,6 +108,128 @@ String htmlEscape(const String &value) {
   return escaped;
 }
 
+// Extracts the string value for a JSON key from a small JSON object snippet.
+String jsonExtractString(const String &obj, const String &key) {
+  const String searchKey = "\"" + key + "\"";
+  int keyPos = obj.indexOf(searchKey);
+  if (keyPos < 0) return "";
+  int colonPos = obj.indexOf(':', keyPos + searchKey.length());
+  if (colonPos < 0) return "";
+  int valStart = colonPos + 1;
+  while (valStart < (int)obj.length() && obj[valStart] == ' ') valStart++;
+  if (valStart >= (int)obj.length()) return "";
+  if (obj[valStart] == '"') {
+    int end = obj.indexOf('"', valStart + 1);
+    if (end < 0) return "";
+    return obj.substring(valStart + 1, end);
+  }
+  int end = valStart;
+  while (end < (int)obj.length() && obj[end] != ',' && obj[end] != '}' && obj[end] != ']') end++;
+  return obj.substring(valStart, end);
+}
+
+void saveMappingsToNvs() {
+  String serialized;
+  for (auto &entry : g_accessMappings) {
+    serialized += String(entry.first) + (entry.second ? ":1," : ":0,");
+  }
+  if (serialized.endsWith(",")) {
+    serialized.remove(serialized.length() - 1);
+  }
+  g_preferences.begin("accesscfg", false);
+  g_preferences.putString("acl_cache", serialized);
+  g_preferences.end();
+  Serial.print("Saved ");
+  Serial.print(g_accessMappings.size());
+  Serial.println(" access mappings to NVS.");
+}
+
+void loadMappingsFromNvs() {
+  g_preferences.begin("accesscfg", true);
+  String serialized = g_preferences.getString("acl_cache", "");
+  g_preferences.end();
+
+  g_accessMappings.clear();
+  if (serialized.length() == 0) return;
+
+  int pos = 0;
+  while (pos < (int)serialized.length()) {
+    int colonPos = serialized.indexOf(':', pos);
+    if (colonPos < 0) break;
+    int commaPos = serialized.indexOf(',', colonPos + 1);
+    if (commaPos < 0) commaPos = serialized.length();
+    uint32_t id = (uint32_t)serialized.substring(pos, colonPos).toInt();
+    bool isGrant = (serialized.charAt(colonPos + 1) == '1');
+    g_accessMappings[id] = isGrant;
+    pos = commaPos + 1;
+  }
+  Serial.print("Loaded ");
+  Serial.print(g_accessMappings.size());
+  Serial.println(" access mappings from NVS.");
+}
+
+void parseMappingsFromJson(const String &json) {
+  int arrStart = json.indexOf("\"mappings\"");
+  if (arrStart < 0) {
+    Serial.println("No 'mappings' key in response.");
+    return;
+  }
+  arrStart = json.indexOf('[', arrStart);
+  if (arrStart < 0) return;
+  int arrEnd = json.lastIndexOf(']');
+  if (arrEnd <= arrStart) return;
+
+  std::map<uint32_t, bool> newMappings;
+  int pos = arrStart;
+  while (pos < arrEnd) {
+    int objStart = json.indexOf('{', pos);
+    if (objStart < 0 || objStart >= arrEnd) break;
+    int objEnd = json.indexOf('}', objStart);
+    if (objEnd < 0 || objEnd > arrEnd) break;
+
+    const String obj = json.substring(objStart, objEnd + 1);
+    const String idStr = jsonExtractString(obj, "device_access_id");
+    const String accStr = jsonExtractString(obj, "access");
+
+    if (idStr.length() > 0 && accStr.length() > 0) {
+      uint32_t id = (uint32_t)idStr.toInt();
+      newMappings[id] = (accStr == "GRANT");
+    }
+    pos = objEnd + 1;
+  }
+
+  if (!newMappings.empty()) {
+    g_accessMappings = std::move(newMappings);
+    Serial.print("Parsed ");
+    Serial.print(g_accessMappings.size());
+    Serial.println(" access mappings.");
+  } else {
+    Serial.println("No valid mappings parsed; keeping existing cache.");
+  }
+}
+
+void fetchAccessMappings() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(API_URL);
+  if (g_apiKey.length() > 0) {
+    http.addHeader("X-API-Key", g_apiKey);
+  }
+
+  Serial.println("Fetching access mappings from server...");
+  const int code = http.GET();
+  if (code == 200) {
+    parseMappingsFromJson(http.getString());
+    saveMappingsToNvs();
+  } else {
+    Serial.print("Failed to fetch access mappings, HTTP: ");
+    Serial.println(code);
+  }
+  http.end();
+  g_lastMappingsFetchMs = millis();
+}
+
 void loadRuntimeConfig() {
   g_preferences.begin("accesscfg", true);
   g_wifiSsid = g_preferences.getString("ssid", WIFI_SSID);
@@ -119,6 +247,7 @@ void loadRuntimeConfig() {
   if (g_configWebPassword.length() < 4 || g_configWebPassword.length() > 63) {
     g_configWebPassword = CONFIG_WEB_PASSWORD_DEFAULT;
   }
+  loadMappingsFromNvs();
 }
 
 void saveRuntimeConfig() {
@@ -241,6 +370,7 @@ bool connectToConfiguredWiFi() {
     digitalWrite(LED_AUTHORIZED, LOW);
     digitalWrite(LED_REJECTED, HIGH);
     CURRENT_LED_REJECTED_STATE = LOW;
+    fetchAccessMappings();
     return true;
   }
 
@@ -675,7 +805,10 @@ void handleTamperSwitch() {
 }
 
 void sendToServer(uint32_t accessId) {
-  if(WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED) {
+
+    changeoverControlTo("THIS_DEVICE");
+
     HTTPClient http;
     http.begin(API_URL);
     http.addHeader("Content-Type", "application/json");
@@ -687,30 +820,46 @@ void sendToServer(uint32_t accessId) {
     feedbackProcessing();
     int httpResponseCode = http.POST(payload);
 
-    if(httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println("Server response: " + response);
-
-      // parse {"access": "GRANT"}
-
-
-      if(response.indexOf("\"access\": \"GRANT\"") >= 0) {
+    if (httpResponseCode > 0) {
+      // Server responded — use its decision, do not touch cache.
+      const String response = http.getString();
+      http.end();
+      if (httpResponseCode == 200 && response.indexOf("\"access\": \"GRANT\"") >= 0) {
         Serial.println("Access granted by server");
         grant();
       } else {
         Serial.println("Access denied by server");
         feedbackReject();
       }
+      return;
+    }
+
+    http.end();
+    // POST failed (network-level error): fall through to cache below.
+    Serial.print("POST failed, HTTP: ");
+    Serial.println(httpResponseCode);
+
+    // Fallback: use cached decision when server is unreachable or WiFi is down.
+    auto it = g_accessMappings.find(accessId);
+    if (it != g_accessMappings.end()) {
+      Serial.print("Cache fallback for ID ");
+      Serial.print(accessId);
+      Serial.println(it->second ? ": GRANT" : ": REJECT");
+      if (it->second) {
+        grant();
+      } else {
+        feedbackReject();
+      }
     } else {
-      Serial.println("Error sending POST: " + String(httpResponseCode));
+      Serial.println("No cached decision for this ID. Rejecting.");
       feedbackReject();
     }
-    http.end();
+
   } else {
-    Serial.println("WiFi not connected");
-    // handover control back to external controller on WiFi failure
+    Serial.println("WiFi not connected.");
     changeoverControlTo("EXTERNAL_CONTROLLER");
   }
+
 }
 
 void setup(){
@@ -819,6 +968,12 @@ void loop(){
 
   handleTamperSwitch();
   readWiegandInput();
+
+  // Periodically refresh access mappings from server.
+  if (WiFi.status() == WL_CONNECTED &&
+      (g_lastMappingsFetchMs == 0 || (millis() - g_lastMappingsFetchMs) >= MAPPINGS_REFRESH_INTERVAL_MS)) {
+    fetchAccessMappings();
+  }
 
   if (CURRENT_LED_REJECTED_STATE == LOW && WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_REJECTED, HIGH);
