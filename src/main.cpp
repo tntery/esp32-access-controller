@@ -32,7 +32,7 @@ const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 300000UL; // 5 minutes
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 14400000UL; // 5 minutes
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -106,6 +106,28 @@ String htmlEscape(const String &value) {
   escaped.replace("\"", "&quot;");
   escaped.replace("'", "&#39;");
   return escaped;
+}
+
+void logStringDebug(const char *label, const String &value) {
+  Serial.print(label);
+  Serial.print(" [");
+  Serial.print(value.length());
+  Serial.println(" chars]");
+  Serial.print("  quoted: >");
+  Serial.print(value);
+  Serial.println("<");
+  Serial.print("  bytes: ");
+  for (size_t i = 0; i < value.length(); i++) {
+    if (i > 0) {
+      Serial.print(' ');
+    }
+    uint8_t b = static_cast<uint8_t>(value[i]);
+    if (b < 16) {
+      Serial.print('0');
+    }
+    Serial.print(b, HEX);
+  }
+  Serial.println();
 }
 
 // Extracts the string value for a JSON key from a small JSON object snippet.
@@ -240,12 +262,29 @@ void loadRuntimeConfig() {
   g_tamperEnabled = g_preferences.getBool("tamper_en", true);
   g_preferences.end();
 
+  // Normalize values loaded from NVS to avoid invisible whitespace issues.
+  const String apBefore = g_configApPassword;
+  const String webBefore = g_configWebPassword;
+  g_configApPassword.trim();
+  g_configWebPassword.trim();
+
+  bool configUpdated = (g_configApPassword != apBefore) || (g_configWebPassword != webBefore);
+
   if (g_configApPassword.length() < 8 || g_configApPassword.length() > 63) {
     g_configApPassword = CONFIG_AP_PASSWORD_DEFAULT;
+    configUpdated = true;
   }
 
   if (g_configWebPassword.length() < 4 || g_configWebPassword.length() > 63) {
     g_configWebPassword = CONFIG_WEB_PASSWORD_DEFAULT;
+    configUpdated = true;
+  }
+
+  if (configUpdated) {
+    g_preferences.begin("accesscfg", false);
+    g_preferences.putString("ap_pass", g_configApPassword);
+    g_preferences.putString("web_pass", g_configWebPassword);
+    g_preferences.end();
   }
   loadMappingsFromNvs();
 }
@@ -263,6 +302,24 @@ void saveRuntimeConfig() {
 
 String buildConfigPageHtml(const String &message) {
   const String checked = g_tamperEnabled ? "checked" : "";
+  const String apIp = WiFi.softAPIP().toString();
+  const String staIp = WiFi.localIP().toString();
+  const String staMac = WiFi.macAddress();
+  const String apMac = WiFi.softAPmacAddress();
+  const String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "Connected" : "Not connected";
+
+  const String deviceInfo =
+    "<div style='margin:12px 0;padding:10px;border:1px solid #ddd;background:#f7f7f7;'>"
+    "<strong>Device Info</strong>"
+    "<div style='margin-top:8px;font-size:14px;line-height:1.5;'>"
+    "<div><b>Setup AP SSID:</b> " + htmlEscape(String(CONFIG_AP_SSID)) + "</div>"
+    "<div><b>Setup AP IP:</b> " + htmlEscape(apIp) + "</div>"
+    "<div><b>Setup AP MAC:</b> " + htmlEscape(apMac) + "</div>"
+    "<div><b>STA IP:</b> " + htmlEscape(staIp) + "</div>"
+    "<div><b>STA MAC:</b> " + htmlEscape(staMac) + "</div>"
+    "<div><b>WiFi Status:</b> " + htmlEscape(wifiStatus) + "</div>"
+    "</div></div>";
+
   const String html =
     "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Access Controller Setup</title>"
@@ -274,12 +331,13 @@ String buildConfigPageHtml(const String &message) {
     ".row{margin-top:12px;display:flex;align-items:center;gap:10px;}</style></head><body>"
     "<h2>Access Controller Setup</h2>"
     "<p>Device is in setup mode. It returns to normal mode after idle timeout.</p>" +
+    deviceInfo +
     (message.length() ? ("<div class='msg'>" + htmlEscape(message) + "</div>") : String("")) +
     "<form method='POST' action='/save'>"
     "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(g_wifiSsid) + "' required>"
     "<label>WiFi Password</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
-    "<label>Setup AP Password (8-63 chars)</label><input type='password' name='ap_password' value='" + htmlEscape(g_configApPassword) + "' minlength='8' maxlength='63' required>"
-    "<label>Setup Page Password (4-63 chars)</label><input type='password' name='web_password' value='" + htmlEscape(g_configWebPassword) + "' minlength='4' maxlength='63' required>"
+    "<label>Setup AP Password (8-63 chars, leave blank to keep current)</label><input type='password' name='ap_password' value='' minlength='8' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
+    "<label>Setup Page Password (4-63 chars, leave blank to keep current)</label><input type='password' name='web_password' value='' minlength='4' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
     "<label>API Key</label><input name='api_key' value='" + htmlEscape(g_apiKey) + "'>"
     "<div class='row'><input id='tamper' type='checkbox' name='tamper_enabled' " + checked + ">"
     "<label for='tamper' style='margin:0;font-weight:400;'>Enable tamper detection</label><span>Enable tamper detection</span></div>"
@@ -308,22 +366,29 @@ void configureWebRoutes() {
     g_wifiSsid = g_webServer.arg("ssid");
     g_wifiPassword = g_webServer.arg("password");
     g_apiKey = g_webServer.arg("api_key");
-    const String requestedApPassword = g_webServer.arg("ap_password");
-    const String requestedWebPassword = g_webServer.arg("web_password");
+    String requestedApPassword = g_webServer.arg("ap_password");
+    String requestedWebPassword = g_webServer.arg("web_password");
+    requestedApPassword.trim();
+    requestedWebPassword.trim();
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
 
-    if (requestedApPassword.length() < 8 || requestedApPassword.length() > 63) {
+    if (requestedApPassword.length() > 0 && (requestedApPassword.length() < 8 || requestedApPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
       return;
     }
 
-    if (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63) {
+    if (requestedWebPassword.length() > 0 && (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("Page password must be 4 to 63 characters."));
       return;
     }
 
-    g_configApPassword = requestedApPassword;
-    g_configWebPassword = requestedWebPassword;
+    if (requestedApPassword.length() > 0) {
+      g_configApPassword = requestedApPassword;
+    }
+
+    if (requestedWebPassword.length() > 0) {
+      g_configWebPassword = requestedWebPassword;
+    }
 
     saveRuntimeConfig();
     g_webServer.send(200, "text/html", buildConfigPageHtml("Saved successfully. Leaving setup mode now."));
@@ -398,14 +463,41 @@ void startConfigMode() {
   g_configLedBlinkState = false;
 
   lockMaglock();
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_AP);
+  Serial.println("=== Setup AP startup parameters ===");
+  logStringDebug("AP SSID (runtime)", String(CONFIG_AP_SSID));
+  logStringDebug("AP password (runtime before trim)", g_configApPassword);
+  logStringDebug("AP password (default macro)", String(CONFIG_AP_PASSWORD_DEFAULT));
 
-  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, g_configApPassword.c_str());
+  String apPassword = g_configApPassword;
+  apPassword.trim();
+  if (apPassword.length() < 8 || apPassword.length() > 63) {
+    apPassword = CONFIG_AP_PASSWORD_DEFAULT;
+  }
+
+  logStringDebug("AP password (used by softAP)", apPassword);
+  Serial.println("AP channel (default): 1");
+  Serial.println("AP hidden (default): 0");
+  Serial.println("AP max connections (default): 4");
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  delay(100);
+
+  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, apPassword.c_str());
+  g_configApPassword = apPassword;
+  Serial.print("ESP32 STA MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("ESP32 AP MAC: ");
+  Serial.println(WiFi.softAPmacAddress());
   Serial.print("Setup AP SSID: ");
   Serial.println(CONFIG_AP_SSID);
   Serial.print("Setup AP protected: ");
   Serial.println(apStarted ? "YES" : "FAILED");
+  Serial.print("Setup AP password length: ");
+  Serial.println(g_configApPassword.length());
   Serial.print("Setup portal IP: ");
   Serial.println(WiFi.softAPIP());
 
@@ -889,7 +981,19 @@ void setup(){
   // Initialize serial
   Serial.begin(115200);
 
+  // Avoid WiFi driver persisting stale AP/STA configuration across reboots.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  delay(50);
+
   loadRuntimeConfig();
+
+  Serial.println("=== Setup AP config at boot ===");
+  Serial.print("ESP32 STA MAC: ");
+  Serial.println(WiFi.macAddress());
+  logStringDebug("AP SSID (macro)", String(CONFIG_AP_SSID));
+  logStringDebug("AP password (loaded runtime)", g_configApPassword);
+  logStringDebug("AP password (default macro)", String(CONFIG_AP_PASSWORD_DEFAULT));
 
   // Initialize all LEDs and buzzer to LOW
   digitalWrite(LED_PROCESSING, LOW);
