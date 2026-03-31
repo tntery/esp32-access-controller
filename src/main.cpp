@@ -3,6 +3,8 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <SPI.h>
+#include <MFRC522.h>
 #include <map>
 
 #include "secrets.h"
@@ -19,9 +21,16 @@ const int TAMPER_SWITCH_PIN = GPIO_NUM_26;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
+// RC522 custom SPI pin map (uses GPIO16/GPIO17 as requested)
+const int RC522_SCK_PIN = GPIO_NUM_17;
+const int RC522_MISO_PIN = GPIO_NUM_34;
+const int RC522_MOSI_PIN = GPIO_NUM_16;
+const int RC522_SS_PIN = GPIO_NUM_23;
+const int RC522_RST_PIN = GPIO_NUM_2;
+
 // control device changeover pins
 const int MAGLOCK_PWR_VCC_RALAY = GPIO_NUM_19; 
-const int MAGLOCK_PWR_GND_RALAY = GPIO_NUM_23;
+const int MAGLOCK_PWR_GND_RALAY = -1; // relay removed
 const int EXIT_BUTTON_INPUT_PULLUP_RELAY = GPIO_NUM_21;
 const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_22;
 
@@ -56,10 +65,22 @@ unsigned long g_lastTamperToggleMs = 0;
 bool g_configLedBlinkState = false;
 unsigned long g_lastConfigLedBlinkMs = 0;
 
-std::map<uint32_t, bool> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
+struct StringLess {
+  bool operator()(const String &lhs, const String &rhs) const {
+    return lhs.compareTo(rhs) < 0;
+  }
+};
+
+std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
 unsigned long g_lastMappingsFetchMs = 0;
 
-void sendToServer(uint32_t accessId);
+MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
+String g_lastRfidUidHex;
+unsigned long g_lastRfidReadMs = 0;
+
+const unsigned long RFID_REPEAT_IGNORE_MS = 1200;
+
+void sendToServer(const String &accessId);
 void startConfigMode();
 void stopConfigMode();
 bool connectToConfiguredWiFi();
@@ -70,6 +91,8 @@ void feedbackReset();
 void handleConfigButtonLongPress();
 void updateConfigModeIndicators();
 void fetchAccessMappings();
+void initRfidReader();
+void readRfidInput();
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -77,7 +100,9 @@ void changeoverControlTo(const char *str) {
     // Connect maglock power to this device and exit button input to this device
     // Energize all control relays to switch connections
     digitalWrite(MAGLOCK_PWR_VCC_RALAY, HIGH);
-    digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    if (MAGLOCK_PWR_GND_RALAY >= 0) {
+      digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    }
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
     // Return LED control to normal runtime feedback flow.
@@ -86,7 +111,9 @@ void changeoverControlTo(const char *str) {
     // Connect maglock power to external controller and exit button input to external controller
     // De-energize all control relays to switch connections
     digitalWrite(MAGLOCK_PWR_VCC_RALAY, LOW);
-    digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
+    if (MAGLOCK_PWR_GND_RALAY >= 0) {
+      digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
+    }
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, LOW);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, LOW);
     // External control indicator: processing and authorized LEDs ON.
@@ -143,17 +170,21 @@ String jsonExtractString(const String &obj, const String &key) {
   if (obj[valStart] == '"') {
     int end = obj.indexOf('"', valStart + 1);
     if (end < 0) return "";
-    return obj.substring(valStart + 1, end);
+    String extracted = obj.substring(valStart + 1, end);
+    extracted.trim();
+    return extracted;
   }
   int end = valStart;
   while (end < (int)obj.length() && obj[end] != ',' && obj[end] != '}' && obj[end] != ']') end++;
-  return obj.substring(valStart, end);
+  String extracted = obj.substring(valStart, end);
+  extracted.trim();
+  return extracted;
 }
 
 void saveMappingsToNvs() {
   String serialized;
   for (auto &entry : g_accessMappings) {
-    serialized += String(entry.first) + (entry.second ? ":1," : ":0,");
+    serialized += entry.first + (entry.second ? ":1," : ":0,");
   }
   if (serialized.endsWith(",")) {
     serialized.remove(serialized.length() - 1);
@@ -180,7 +211,8 @@ void loadMappingsFromNvs() {
     if (colonPos < 0) break;
     int commaPos = serialized.indexOf(',', colonPos + 1);
     if (commaPos < 0) commaPos = serialized.length();
-    uint32_t id = (uint32_t)serialized.substring(pos, colonPos).toInt();
+    String id = serialized.substring(pos, colonPos);
+    id.trim();
     bool isGrant = (serialized.charAt(colonPos + 1) == '1');
     g_accessMappings[id] = isGrant;
     pos = commaPos + 1;
@@ -201,7 +233,7 @@ void parseMappingsFromJson(const String &json) {
   int arrEnd = json.lastIndexOf(']');
   if (arrEnd <= arrStart) return;
 
-  std::map<uint32_t, bool> newMappings;
+  std::map<String, bool, StringLess> newMappings;
   int pos = arrStart;
   while (pos < arrEnd) {
     int objStart = json.indexOf('{', pos);
@@ -214,8 +246,7 @@ void parseMappingsFromJson(const String &json) {
     const String accStr = jsonExtractString(obj, "access");
 
     if (idStr.length() > 0 && accStr.length() > 0) {
-      uint32_t id = (uint32_t)idStr.toInt();
-      newMappings[id] = (accStr == "GRANT");
+      newMappings[idStr] = (accStr == "GRANT");
     }
     pos = objEnd + 1;
   }
@@ -656,7 +687,7 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
 
-    sendToServer(accessId);
+    sendToServer(String(accessId));
 
   } else if (bitCount == 34) {
     const uint32_t accessId = bitsToUint32(bits, 1, 32);
@@ -667,12 +698,71 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.println(accessId);
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
+
+    sendToServer(String(accessId));
   } else {
     Serial.println("Format: Unknown/Custom");
   }
 }
 
 /// end of Wiegand decoding logic //////
+
+String uidToHexString(const MFRC522::Uid &uid) {
+  String hex;
+  for (byte i = 0; i < uid.size; i++) {
+    if (uid.uidByte[i] < 0x10) {
+      hex += "0";
+    }
+    hex += String(uid.uidByte[i], HEX);
+  }
+  hex.toUpperCase();
+  return hex;
+}
+
+void initRfidReader() {
+  SPI.begin(RC522_SCK_PIN, RC522_MISO_PIN, RC522_MOSI_PIN, RC522_SS_PIN);
+  g_mfrc522.PCD_Init();
+  delay(50);
+
+  Serial.println("RC522 initialized");
+  Serial.print("  SCK=");
+  Serial.println(RC522_SCK_PIN);
+  Serial.print("  MISO=");
+  Serial.println(RC522_MISO_PIN);
+  Serial.print("  MOSI=");
+  Serial.println(RC522_MOSI_PIN);
+  Serial.print("  SS=");
+  Serial.println(RC522_SS_PIN);
+  Serial.print("  RST=");
+  Serial.println(RC522_RST_PIN);
+}
+
+void readRfidInput() {
+  if (!g_mfrc522.PICC_IsNewCardPresent() || !g_mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  const String uidHex = uidToHexString(g_mfrc522.uid);
+  const unsigned long now = millis();
+  if (uidHex == g_lastRfidUidHex && (now - g_lastRfidReadMs) < RFID_REPEAT_IGNORE_MS) {
+    g_mfrc522.PICC_HaltA();
+    g_mfrc522.PCD_StopCrypto1();
+    return;
+  }
+
+  g_lastRfidUidHex = uidHex;
+  g_lastRfidReadMs = now;
+
+  Serial.print("RFID UID=");
+  Serial.print(uidHex);
+  Serial.print(" access_id=");
+  Serial.println(uidHex);
+
+  sendToServer(uidHex);
+
+  g_mfrc522.PICC_HaltA();
+  g_mfrc522.PCD_StopCrypto1();
+}
 
 /////////////// Main access control logic below ////////////
 
@@ -896,7 +986,9 @@ void handleTamperSwitch() {
   }
 }
 
-void sendToServer(uint32_t accessId) {
+void sendToServer(const String &accessId) {
+  Serial.print("Processing access ID: ");
+  Serial.println(accessId);
   if (WiFi.status() == WL_CONNECTED) {
 
     changeoverControlTo("THIS_DEVICE");
@@ -908,7 +1000,7 @@ void sendToServer(uint32_t accessId) {
       http.addHeader("X-API-Key", g_apiKey);
     }
 
-    String payload = "{\"access_id\":\"" + String(accessId) + "\"}";
+    String payload = "{\"access_id\":\"" + accessId + "\"}";
     feedbackProcessing();
     int httpResponseCode = http.POST(payload);
 
@@ -970,9 +1062,13 @@ void setup(){
 
   // Set changeover control pins to OUTPUT and initialize to default state (connected to external controller) 
   pinMode(MAGLOCK_PWR_VCC_RALAY, OUTPUT);
-  pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
+  if (MAGLOCK_PWR_GND_RALAY >= 0) {
+    pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
+  }
   pinMode(EXIT_BUTTON_INPUT_PULLUP_RELAY, OUTPUT);
   pinMode(EXIT_BUTTON_INPUT_GND_RELAY, OUTPUT);
+  pinMode(RC522_RST_PIN, OUTPUT);
+  pinMode(RC522_SS_PIN, OUTPUT);
   changeoverControlTo("EXTERNAL_CONTROLLER");
 
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onD0Pulse, FALLING);
@@ -1020,6 +1116,7 @@ void setup(){
   digitalWrite(MAGLOCK_RELAY, LOW);
 
   connectToConfiguredWiFi();
+  initRfidReader();
 
 }
 
@@ -1072,6 +1169,7 @@ void loop(){
 
   handleTamperSwitch();
   readWiegandInput();
+  readRfidInput();
 
   // Periodically refresh access mappings from server.
   if (WiFi.status() == WL_CONNECTED &&
