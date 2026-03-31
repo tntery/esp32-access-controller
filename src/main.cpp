@@ -93,6 +93,8 @@ void updateConfigModeIndicators();
 void fetchAccessMappings();
 void initRfidReader();
 void readRfidInput();
+void sendEventToServer(const String &eventAccessId);
+String buildEventAccessId(const String &status);
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -401,6 +403,7 @@ void configureWebRoutes() {
     String requestedWebPassword = g_webServer.arg("web_password");
     requestedApPassword.trim();
     requestedWebPassword.trim();
+    const bool previousTamperEnabled = g_tamperEnabled;
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
 
     if (requestedApPassword.length() > 0 && (requestedApPassword.length() < 8 || requestedApPassword.length() > 63)) {
@@ -422,6 +425,11 @@ void configureWebRoutes() {
     }
 
     saveRuntimeConfig();
+
+    if (previousTamperEnabled != g_tamperEnabled) {
+      sendEventToServer(buildEventAccessId(g_tamperEnabled ? "TAMPER_CFG_ENABLED" : "TAMPER_CFG_DISABLED"));
+    }
+
     g_webServer.send(200, "text/html", buildConfigPageHtml("Saved successfully. Leaving setup mode now."));
     g_exitConfigModeRequested = true;
   });
@@ -940,6 +948,35 @@ void updateConfigModeIndicators() {
   }
 }
 
+String buildEventAccessId(const String &status) {
+  return status + "+" + String(millis());
+}
+
+void sendEventToServer(const String &eventAccessId) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Event not sent, WiFi not connected: ");
+    Serial.println(eventAccessId);
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(API_URL);
+  http.addHeader("Content-Type", "application/json");
+  if (g_apiKey.length() > 0) {
+    http.addHeader("X-API-Key", g_apiKey);
+  }
+
+  String payload = "{\"access_id\":\"" + eventAccessId + "\"}";
+  const int httpResponseCode = http.POST(payload);
+
+  Serial.print("Event POST access_id=");
+  Serial.print(eventAccessId);
+  Serial.print(" HTTP=");
+  Serial.println(httpResponseCode);
+
+  http.end();
+}
+
 void handleTamperSwitch() {
   static int lastReading = LOW;
   static int stableState = LOW;
@@ -971,11 +1008,13 @@ void handleTamperSwitch() {
       g_tamperBuzzerState = true;
       g_lastTamperToggleMs = millis();
       digitalWrite(BUZZER, HIGH);
+      sendEventToServer(buildEventAccessId("TAMPER_OPEN"));
     } else {
       Serial.println("Tamper switch restored. Stopping buzzer alarm.");
       g_tamperAlarmActive = false;
       g_tamperBuzzerState = false;
       digitalWrite(BUZZER, LOW);
+      sendEventToServer(buildEventAccessId("TAMPER_RESTORED"));
     }
   }
 
