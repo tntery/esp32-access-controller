@@ -65,6 +65,10 @@ unsigned long g_lastTamperToggleMs = 0;
 bool g_configLedBlinkState = false;
 unsigned long g_lastConfigLedBlinkMs = 0;
 
+// Idle indicator blink state (two short blinks + long break on LED_AUTHORIZED)
+uint8_t g_idleBlinkStep = 0;
+unsigned long g_lastIdleBlinkMs = 0;
+
 struct StringLess {
   bool operator()(const String &lhs, const String &rhs) const {
     return lhs.compareTo(rhs) < 0;
@@ -786,6 +790,10 @@ void feedbackProcessing() {
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(LED_PROCESSING, HIGH);
+  // Short single beep on access event detection
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
 }
 
 void grant() {
@@ -818,6 +826,8 @@ void grant() {
 void feedbackReject(bool idle = false) {
   // provide feedback for rejected access
   digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);  // ensure idle blink LED is off
+  g_idleBlinkStep = 0;
   digitalWrite(LED_REJECTED, HIGH);
 
   CURRENT_LED_REJECTED_STATE = HIGH;
@@ -945,6 +955,20 @@ void updateConfigModeIndicators() {
     g_configLedBlinkState = !g_configLedBlinkState;
     digitalWrite(LED_PROCESSING, g_configLedBlinkState ? HIGH : LOW);
     digitalWrite(LED_AUTHORIZED, g_configLedBlinkState ? HIGH : LOW);
+  }
+}
+
+// Two short blinks (120 ms on / 120 ms off) followed by a 1600 ms break on LED_AUTHORIZED.
+void updateIdleIndicator() {
+  // Steps: 0=blink1 on, 1=blink1 off, 2=blink2 on, 3=blink2 off (long break)
+  const unsigned long stepDurations[4] = { 120, 120, 120, 1600 };
+  const unsigned long now = millis();
+
+  if ((now - g_lastIdleBlinkMs) >= stepDurations[g_idleBlinkStep]) {
+    g_lastIdleBlinkMs = now;
+    g_idleBlinkStep = (g_idleBlinkStep + 1) % 4;
+    // Steps 0 and 2 are the ON phases
+    digitalWrite(LED_AUTHORIZED, (g_idleBlinkStep == 0 || g_idleBlinkStep == 2) ? HIGH : LOW);
   }
 }
 
@@ -1217,7 +1241,8 @@ void loop(){
   }
 
   if (CURRENT_LED_REJECTED_STATE == LOW && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_REJECTED, HIGH);
+    digitalWrite(LED_REJECTED, LOW);
+    updateIdleIndicator();
   }
 
   delay(1);
