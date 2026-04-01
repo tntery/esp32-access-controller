@@ -84,7 +84,14 @@ unsigned long g_lastRfidReadMs = 0;
 
 const unsigned long RFID_REPEAT_IGNORE_MS = 1200;
 
-void sendToServer(const String &accessId);
+// Pairing mode state machine
+enum PairingState { PAIRING_IDLE, PAIRING_RFID_FIRST_TAP_BUFFERED, PAIRING_WAIT_WIEGAND };
+PairingState g_pairingState = PAIRING_IDLE;
+String g_pairingRfidUid;
+unsigned long g_pairingRfidFirstTapMs = 0;
+const unsigned long PAIRING_RFID_DOUBLE_TAP_WINDOW_MS = 600;  // 0.6 second to detect second tap before sending first tap
+
+void sendToServer(const String &accessId, bool playProcessingFeedback = true);
 void startConfigMode();
 void stopConfigMode();
 bool connectToConfiguredWiFi();
@@ -99,6 +106,9 @@ void initRfidReader();
 void readRfidInput();
 void sendEventToServer(const String &eventAccessId);
 String buildEventAccessId(const String &status);
+void emitShortBuzzer();
+void emitDoubleBuzzer();
+void handlePairingWiegandInput(const String &wiegandId);
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -699,7 +709,13 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
 
-    sendToServer(String(accessId));
+    String wiegandStr = String(accessId);
+    if (g_pairingState == PAIRING_WAIT_WIEGAND) {
+      handlePairingWiegandInput(wiegandStr);
+    } else {
+      emitShortBuzzer();
+      sendToServer(wiegandStr, false);
+    }
 
   } else if (bitCount == 34) {
     const uint32_t accessId = bitsToUint32(bits, 1, 32);
@@ -711,7 +727,13 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
 
-    sendToServer(String(accessId));
+    String wiegandStr = String(accessId);
+    if (g_pairingState == PAIRING_WAIT_WIEGAND) {
+      handlePairingWiegandInput(wiegandStr);
+    } else {
+      emitShortBuzzer();
+      sendToServer(wiegandStr, false);
+    }
   } else {
     Serial.println("Format: Unknown/Custom");
   }
@@ -750,12 +772,56 @@ void initRfidReader() {
 }
 
 void readRfidInput() {
+  const unsigned long now = millis();
+
+  // First tap buffered: waiting for potential second tap within 1 second
+  if (g_pairingState == PAIRING_RFID_FIRST_TAP_BUFFERED && g_pairingRfidFirstTapMs > 0) {
+    const unsigned long elapsedSinceFirstTap = now - g_pairingRfidFirstTapMs;
+    
+    // Check for second card detection
+    if (g_mfrc522.PICC_IsNewCardPresent() && g_mfrc522.PICC_ReadCardSerial()) {
+      const String uidHex = uidToHexString(g_mfrc522.uid);
+      if (uidHex == g_pairingRfidUid && elapsedSinceFirstTap < PAIRING_RFID_DOUBLE_TAP_WINDOW_MS) {
+        // Second tap detected within 1 second! Enter pairing mode WITHOUT sending first tap
+        g_pairingState = PAIRING_WAIT_WIEGAND;
+        g_pairingRfidFirstTapMs = 0;
+        Serial.println("=== Second tap detected within 1s; Pairing Mode activated ===");
+        Serial.println("Waiting for Wiegand input...");
+        emitDoubleBuzzer();
+        g_mfrc522.PICC_HaltA();
+        g_mfrc522.PCD_StopCrypto1();
+        return;
+      } else {
+        // Different card or window expired; send buffered first tap and process this new card
+        g_mfrc522.PICC_HaltA();
+        g_mfrc522.PCD_StopCrypto1();
+        // Fall through to send buffered first tap
+      }
+    }
+    
+    // Check if window has expired without second tap
+    if (elapsedSinceFirstTap > PAIRING_RFID_DOUBLE_TAP_WINDOW_MS) {
+      // Double-tap window expired; send the buffered first tap to server
+      Serial.println("No second tap; sending initial access to server.");
+      sendToServer(g_pairingRfidUid, false);
+      g_pairingState = PAIRING_IDLE;
+      g_pairingRfidUid = "";
+      g_pairingRfidFirstTapMs = 0;
+      return;
+    }
+    
+    // Still within window and no card present; wait
+    return;
+  }
+
+  // Normal card detection (PAIRING_IDLE or new card during buffering)
   if (!g_mfrc522.PICC_IsNewCardPresent() || !g_mfrc522.PICC_ReadCardSerial()) {
     return;
   }
 
   const String uidHex = uidToHexString(g_mfrc522.uid);
-  const unsigned long now = millis();
+  
+  // Ignore repeated reads of same card within repeat window
   if (uidHex == g_lastRfidUidHex && (now - g_lastRfidReadMs) < RFID_REPEAT_IGNORE_MS) {
     g_mfrc522.PICC_HaltA();
     g_mfrc522.PCD_StopCrypto1();
@@ -765,12 +831,18 @@ void readRfidInput() {
   g_lastRfidUidHex = uidHex;
   g_lastRfidReadMs = now;
 
+  // First tap detected: buffer it and enable double-tap detection window
   Serial.print("RFID UID=");
   Serial.print(uidHex);
   Serial.print(" access_id=");
   Serial.println(uidHex);
-
-  sendToServer(uidHex);
+  Serial.println("  [Tap again within 1s to enter pairing mode]");
+  emitShortBuzzer();  // Immediate feedback that card was detected
+  
+  // Buffer first tap instead of sending immediately
+  g_pairingState = PAIRING_RFID_FIRST_TAP_BUFFERED;
+  g_pairingRfidUid = uidHex;
+  g_pairingRfidFirstTapMs = now;
 
   g_mfrc522.PICC_HaltA();
   g_mfrc522.PCD_StopCrypto1();
@@ -786,14 +858,16 @@ void lockMaglock() {
   digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
-void feedbackProcessing() {
+void feedbackProcessing(bool withBuzzer = true) {
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(LED_PROCESSING, HIGH);
-  // Short single beep on access event detection
-  digitalWrite(BUZZER, HIGH);
-  delay(80);
-  digitalWrite(BUZZER, LOW);
+  if (withBuzzer) {
+    // Short single beep on access event detection
+    digitalWrite(BUZZER, HIGH);
+    delay(80);
+    digitalWrite(BUZZER, LOW);
+  }
 }
 
 void grant() {
@@ -961,7 +1035,7 @@ void updateConfigModeIndicators() {
 // Two short blinks (120 ms on / 120 ms off) followed by a 1600 ms break on LED_AUTHORIZED.
 void updateIdleIndicator() {
   // Steps: 0=blink1 on, 1=blink1 off, 2=blink2 on, 3=blink2 off (long break)
-  const unsigned long stepDurations[4] = { 120, 120, 120, 1600 };
+  const unsigned long stepDurations[4] = { 150, 400, 150, 3000 };
   const unsigned long now = millis();
 
   if ((now - g_lastIdleBlinkMs) >= stepDurations[g_idleBlinkStep]) {
@@ -999,6 +1073,45 @@ void sendEventToServer(const String &eventAccessId) {
   Serial.println(httpResponseCode);
 
   http.end();
+}
+
+void emitShortBuzzer() {
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+}
+
+void emitDoubleBuzzer() {
+  // Two quick beeps: 80ms on, 80ms off, 80ms on, 80ms off
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+  delay(80);
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+}
+
+void handlePairingWiegandInput(const String &wiegandId) {
+  if (g_pairingState != PAIRING_WAIT_WIEGAND) {
+    return;  // Not in pairing mode, ignore
+  }
+
+  // Build paired ID: "CARD-rfiduid-WIEGAND-wiegandid"
+  String pairedId = "CARD-" + g_pairingRfidUid + "-WIEGAND-" + wiegandId;
+  
+  Serial.print("=== Pairing Complete: ");
+  Serial.println(pairedId);
+  
+  // Emit second double buzzer to confirm
+  emitDoubleBuzzer();
+  
+  // Reset pairing state
+  g_pairingState = PAIRING_IDLE;
+  g_pairingRfidUid = "";
+  
+  // Send the paired ID to server
+  sendToServer(pairedId, false);
 }
 
 void handleTamperSwitch() {
@@ -1049,7 +1162,7 @@ void handleTamperSwitch() {
   }
 }
 
-void sendToServer(const String &accessId) {
+void sendToServer(const String &accessId, bool playProcessingFeedback) {
   Serial.print("Processing access ID: ");
   Serial.println(accessId);
   if (WiFi.status() == WL_CONNECTED) {
@@ -1064,7 +1177,7 @@ void sendToServer(const String &accessId) {
     }
 
     String payload = "{\"access_id\":\"" + accessId + "\"}";
-    feedbackProcessing();
+    feedbackProcessing(playProcessingFeedback);
     int httpResponseCode = http.POST(payload);
 
     if (httpResponseCode > 0) {
