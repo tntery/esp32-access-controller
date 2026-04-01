@@ -109,6 +109,7 @@ String buildEventAccessId(const String &status);
 void emitShortBuzzer();
 void emitDoubleBuzzer();
 void handlePairingWiegandInput(const String &wiegandId);
+void applyAccessDecisionFromCache(const String &accessId);
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -493,12 +494,12 @@ bool connectToConfiguredWiFi() {
   }
 
   Serial.println("WiFi connection failed within timeout");
-  changeoverControlTo("EXTERNAL_CONTROLLER");
+  changeoverControlTo("THIS_DEVICE");
 
-  // On connection failure, show external-control style LEDs.
-  digitalWrite(LED_REJECTED, LOW);
-  digitalWrite(LED_PROCESSING, HIGH);
-  digitalWrite(LED_AUTHORIZED, HIGH);
+  // Keep this device in control on connection failure.
+  digitalWrite(LED_REJECTED, HIGH);
+  digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
   CURRENT_LED_REJECTED_STATE = LOW;
   return false;
 }
@@ -918,6 +919,10 @@ void feedbackReject(bool idle = false) {
     delay(80);
   }
 
+  // Return to idle indicator behavior after rejection feedback completes.
+  digitalWrite(LED_REJECTED, LOW);
+  CURRENT_LED_REJECTED_STATE = LOW;
+
 }
 
 void feedbackReset() {
@@ -1041,8 +1046,16 @@ void updateIdleIndicator() {
   if ((now - g_lastIdleBlinkMs) >= stepDurations[g_idleBlinkStep]) {
     g_lastIdleBlinkMs = now;
     g_idleBlinkStep = (g_idleBlinkStep + 1) % 4;
-    // Steps 0 and 2 are the ON phases
-    digitalWrite(LED_AUTHORIZED, (g_idleBlinkStep == 0 || g_idleBlinkStep == 2) ? HIGH : LOW);
+    // Steps 0 and 2 are the ON phases for idle pattern.
+    const int idleOn = (g_idleBlinkStep == 0 || g_idleBlinkStep == 2) ? HIGH : LOW;
+    digitalWrite(LED_AUTHORIZED, idleOn);
+
+    // When WiFi is down, blink rejected LED together with authorized LED.
+    if (WiFi.status() != WL_CONNECTED) {
+      digitalWrite(LED_REJECTED, idleOn);
+    } else {
+      digitalWrite(LED_REJECTED, LOW);
+    }
   }
 }
 
@@ -1112,6 +1125,23 @@ void handlePairingWiegandInput(const String &wiegandId) {
   
   // Send the paired ID to server
   sendToServer(pairedId, false);
+}
+
+void applyAccessDecisionFromCache(const String &accessId) {
+  auto it = g_accessMappings.find(accessId);
+  if (it != g_accessMappings.end()) {
+    Serial.print("Cache fallback for ID ");
+    Serial.print(accessId);
+    Serial.println(it->second ? ": GRANT" : ": REJECT");
+    if (it->second) {
+      grant();
+    } else {
+      feedbackReject();
+    }
+  } else {
+    Serial.println("No cached decision for this ID. Rejecting.");
+    feedbackReject();
+  }
 }
 
 void handleTamperSwitch() {
@@ -1199,25 +1229,14 @@ void sendToServer(const String &accessId, bool playProcessingFeedback) {
     Serial.print("POST failed, HTTP: ");
     Serial.println(httpResponseCode);
 
-    // Fallback: use cached decision when server is unreachable or WiFi is down.
-    auto it = g_accessMappings.find(accessId);
-    if (it != g_accessMappings.end()) {
-      Serial.print("Cache fallback for ID ");
-      Serial.print(accessId);
-      Serial.println(it->second ? ": GRANT" : ": REJECT");
-      if (it->second) {
-        grant();
-      } else {
-        feedbackReject();
-      }
-    } else {
-      Serial.println("No cached decision for this ID. Rejecting.");
-      feedbackReject();
-    }
+    // Fallback: use cached decision when server is unreachable.
+    applyAccessDecisionFromCache(accessId);
 
   } else {
     Serial.println("WiFi not connected.");
-    changeoverControlTo("EXTERNAL_CONTROLLER");
+    changeoverControlTo("THIS_DEVICE");
+    feedbackProcessing(playProcessingFeedback);
+    applyAccessDecisionFromCache(accessId);
   }
 
 }
@@ -1236,7 +1255,7 @@ void setup(){
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
-  // Set changeover control pins to OUTPUT and initialize to default state (connected to external controller) 
+  // Set changeover control pins to OUTPUT and keep control with this device from boot.
   pinMode(MAGLOCK_PWR_VCC_RALAY, OUTPUT);
   if (MAGLOCK_PWR_GND_RALAY >= 0) {
     pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
@@ -1245,7 +1264,7 @@ void setup(){
   pinMode(EXIT_BUTTON_INPUT_GND_RELAY, OUTPUT);
   pinMode(RC522_RST_PIN, OUTPUT);
   pinMode(RC522_SS_PIN, OUTPUT);
-  changeoverControlTo("EXTERNAL_CONTROLLER");
+  changeoverControlTo("THIS_DEVICE");
 
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onD0Pulse, FALLING);
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D1_PIN), onD1Pulse, FALLING);
@@ -1353,8 +1372,7 @@ void loop(){
     fetchAccessMappings();
   }
 
-  if (CURRENT_LED_REJECTED_STATE == LOW && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_REJECTED, LOW);
+  if (CURRENT_LED_REJECTED_STATE == LOW) {
     updateIdleIndicator();
   }
 
