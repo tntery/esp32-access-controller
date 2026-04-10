@@ -44,10 +44,14 @@ const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 14400000UL; // 4 hours
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 1800000; // 30 minutes
+
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 7200000UL; // 2 hours
+const unsigned long MAPPINGS_NVS_SAVE_INTERVAL_MS = 43200000UL; // 12 hours
 
 const unsigned long HTTP_CONNECT_TIMEOUT_MS = 3000;
 const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
+const unsigned long HTTP_RESPONSE_TIMEOUT_GET_MAPPINGS_MS = 20000;
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -70,6 +74,7 @@ bool g_tamperBuzzerState = false;
 unsigned long g_lastTamperToggleMs = 0;
 bool g_configLedBlinkState = false;
 unsigned long g_lastConfigLedBlinkMs = 0;
+unsigned long g_lastWifiCheckMs = 0;
 
 // Idle indicator blink state (two short blinks + long break on LED_AUTHORIZED)
 uint8_t g_idleBlinkStep = 0;
@@ -83,6 +88,8 @@ struct StringLess {
 
 std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
 unsigned long g_lastMappingsFetchMs = 0;
+unsigned long g_lastMappingsNvsSaveMs = 0;
+bool g_accessMappingsDirty = false;
 
 MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
 String g_lastRfidUidHex;
@@ -268,6 +275,8 @@ void saveMappingsToNvs() {
   g_preferences.begin("accesscfg", false);
   g_preferences.putString("acl_cache", serialized);
   g_preferences.end();
+  g_lastMappingsNvsSaveMs = millis();
+  g_accessMappingsDirty = false;
   Serial.print("Saved ");
   Serial.print(g_accessMappings.size());
   Serial.println(" access mappings to NVS.");
@@ -279,6 +288,8 @@ void loadMappingsFromNvs() {
   g_preferences.end();
 
   g_accessMappings.clear();
+  g_accessMappingsDirty = false;
+  g_lastMappingsNvsSaveMs = millis();
   if (serialized.length() == 0) return;
 
   int pos = 0;
@@ -328,10 +339,15 @@ void parseMappingsFromJson(const String &json) {
   }
 
   if (!newMappings.empty()) {
-    g_accessMappings = std::move(newMappings);
-    Serial.print("Parsed ");
-    Serial.print(g_accessMappings.size());
-    Serial.println(" access mappings.");
+    if (newMappings != g_accessMappings) {
+      g_accessMappings = std::move(newMappings);
+      g_accessMappingsDirty = true;
+      Serial.print("Parsed ");
+      Serial.print(g_accessMappings.size());
+      Serial.println(" updated access mappings (RAM cache).");
+    } else {
+      Serial.println("Mappings unchanged; keeping current RAM cache.");
+    }
   } else {
     Serial.println("No valid mappings parsed; keeping existing cache.");
   }
@@ -341,7 +357,7 @@ void fetchAccessMappings() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
-  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_GET_MAPPINGS_MS);
   http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
   if (!http.begin(API_URL)) {
     Serial.println("Unable to connect to server");
@@ -356,7 +372,6 @@ void fetchAccessMappings() {
   const int code = http.GET();
   if (code == 200) {
     parseMappingsFromJson(http.getString());
-    saveMappingsToNvs();
   } else {
     Serial.print("Failed to fetch access mappings, HTTP: ");
     Serial.println(code);
@@ -1457,8 +1472,21 @@ void loop(){
     fetchAccessMappings();
   }
 
+  // Persist access mappings to NVS less frequently to reduce flash wear.
+  if (g_accessMappingsDirty &&
+      (g_lastMappingsNvsSaveMs == 0 || (millis() - g_lastMappingsNvsSaveMs) >= MAPPINGS_NVS_SAVE_INTERVAL_MS)) {
+    saveMappingsToNvs();
+  }
+
   if (CURRENT_LED_REJECTED_STATE == LOW) {
     updateIdleIndicator();
+  }
+
+  // if wifi is disconnected, try and reconnect every 30 minutes
+  if (WiFi.status() != WL_CONNECTED && (millis() - g_lastWifiCheckMs) >= WIFI_RECONNECT_INTERVAL_MS) {
+    g_lastWifiCheckMs = millis();
+    Serial.println("WiFi disconnected. Attempting reconnection...");
+    connectToConfiguredWiFi();
   }
 
   resetWatchdog();
