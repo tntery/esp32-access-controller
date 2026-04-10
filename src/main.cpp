@@ -123,6 +123,7 @@ void emitShortBuzzer();
 void emitDoubleBuzzer();
 void handlePairingWiegandInput(const String &wiegandId);
 void applyAccessDecisionFromCache(const String &accessId);
+bool tryGetAccessDecisionFromCache(const String &accessId, bool &isGrant);
 
 
 // === WATCHDOG ===
@@ -1230,6 +1231,16 @@ void applyAccessDecisionFromCache(const String &accessId) {
   }
 }
 
+bool tryGetAccessDecisionFromCache(const String &accessId, bool &isGrant) {
+  auto it = g_accessMappings.find(accessId);
+  if (it == g_accessMappings.end()) {
+    return false;
+  }
+
+  isGrant = it->second;
+  return true;
+}
+
 void handleTamperSwitch() {
   static int lastReading = LOW;
   static int stableState = LOW;
@@ -1281,6 +1292,20 @@ void handleTamperSwitch() {
 void sendToServer(const String &accessId, bool playProcessingFeedback) {
   Serial.print("Processing access ID: ");
   Serial.println(accessId);
+
+  bool cachedGrant = false;
+  const bool hasCachedDecision = tryGetAccessDecisionFromCache(accessId, cachedGrant);
+
+  // Cache-first policy: grant immediately from cache; only hit network on cache miss or cached reject.
+  if (hasCachedDecision && cachedGrant) {
+    Serial.print("Cache-first decision for ID ");
+    Serial.println(accessId + ": GRANT");
+    changeoverControlTo("THIS_DEVICE");
+    feedbackProcessing(playProcessingFeedback);
+    grant();
+    return;
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
 
     changeoverControlTo("THIS_DEVICE");
@@ -1322,14 +1347,26 @@ void sendToServer(const String &accessId, bool playProcessingFeedback) {
     Serial.print("POST failed, HTTP: ");
     Serial.println(httpResponseCode);
 
-    // Fallback: use cached decision when server is unreachable.
-    applyAccessDecisionFromCache(accessId);
+    // Network failed. If cached reject exists, keep rejecting. On miss, reject by default.
+    if (hasCachedDecision) {
+      Serial.println("Using cached REJECT after network failure.");
+      feedbackReject();
+    } else {
+      Serial.println("No cached decision for this ID after network failure. Rejecting.");
+      feedbackReject();
+    }
 
   } else {
     Serial.println("WiFi not connected.");
     changeoverControlTo("THIS_DEVICE");
     feedbackProcessing(playProcessingFeedback);
-    applyAccessDecisionFromCache(accessId);
+    if (hasCachedDecision) {
+      Serial.println("Using cached REJECT while offline.");
+      feedbackReject();
+    } else {
+      Serial.println("No cached decision for this ID while offline. Rejecting.");
+      feedbackReject();
+    }
   }
 
 }
