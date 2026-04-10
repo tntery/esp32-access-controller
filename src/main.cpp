@@ -42,16 +42,18 @@ int short CURRENT_LED_REJECTED_STATE = LOW;
 const unsigned long BUTTON_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
+const unsigned long CONFIG_EXIT_ARM_DELAY_MS = 10000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 1800000; // 30 minutes
 
-const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 7200000UL; // 2 hours
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 3600000UL; // 1 hour
 const unsigned long MAPPINGS_NVS_SAVE_INTERVAL_MS = 43200000UL; // 12 hours
 
 const unsigned long HTTP_CONNECT_TIMEOUT_MS = 3000;
 const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
 const unsigned long HTTP_RESPONSE_TIMEOUT_GET_MAPPINGS_MS = 20000;
+const char *WIFI_STARTUP_PROBE_URL = "http://connectivitycheck.gstatic.com/generate_204";
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -66,8 +68,10 @@ String g_configWebPassword;
 bool g_tamperEnabled = true;
 bool g_configModeActive = false;
 unsigned long g_configModeLastActivityMs = 0;
+unsigned long g_configModeEnteredMs = 0;
 bool g_webRoutesConfigured = false;
 bool g_exitConfigModeRequested = false;
+bool g_requireConfigButtonReleaseForExit = false;
 
 bool g_tamperAlarmActive = false;
 bool g_tamperBuzzerState = false;
@@ -118,6 +122,7 @@ void fetchAccessMappings();
 void initRfidReader();
 void readRfidInput();
 void sendEventToServer(const String &eventAccessId);
+void probeWiFiInternetOnStartup();
 String buildEventAccessId(const String &status);
 void emitShortBuzzer();
 void emitDoubleBuzzer();
@@ -381,6 +386,32 @@ void fetchAccessMappings() {
   g_lastMappingsFetchMs = millis();
 }
 
+void probeWiFiInternetOnStartup() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping startup internet probe: WiFi not connected.");
+    return;
+  }
+
+  HTTPClient http;
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  if (!http.begin(WIFI_STARTUP_PROBE_URL)) {
+    Serial.println("Startup internet probe: failed to begin request.");
+    return;
+  }
+
+  Serial.println("Running startup internet probe...");
+  const int code = http.GET();
+  if (code == 204 || code == 200) {
+    Serial.print("Startup internet probe OK, HTTP=");
+    Serial.println(code);
+  } else {
+    Serial.print("Startup internet probe failed, HTTP=");
+    Serial.println(code);
+  }
+  http.end();
+}
+
 void loadRuntimeConfig() {
   g_preferences.begin("accesscfg", true);
   g_wifiSsid = g_preferences.getString("ssid", WIFI_SSID);
@@ -550,6 +581,7 @@ bool connectToConfiguredWiFi() {
   bool ledBlinkState = false;
   const unsigned long startMs = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_CONNECT_TIMEOUT_MS) {
+    resetWatchdog();
     ledBlinkState = !ledBlinkState;
     digitalWrite(LED_PROCESSING, ledBlinkState ? HIGH : LOW);
     delay(500);
@@ -593,6 +625,8 @@ void startConfigMode() {
   Serial.println("Entering setup mode via long button press");
   g_configModeActive = true;
   g_exitConfigModeRequested = false;
+  g_requireConfigButtonReleaseForExit = true;
+  g_configModeEnteredMs = millis();
   g_configModeLastActivityMs = millis();
   g_lastConfigLedBlinkMs = millis();
   g_configLedBlinkState = false;
@@ -653,6 +687,8 @@ void stopConfigMode() {
   WiFi.softAPdisconnect(true);
   g_configModeActive = false;
   g_exitConfigModeRequested = false;
+  g_requireConfigButtonReleaseForExit = false;
+  g_configModeEnteredMs = 0;
 
   // Leaving setup mode: clear all feedback LEDs before reconnection feedback.
   digitalWrite(LED_REJECTED, LOW);
@@ -1080,6 +1116,16 @@ void handleConfigButtonLongPress() {
 
   const unsigned long pressDurationMs = millis() - pressedStartMs;
 
+  // Require a full release after entering config mode so the same long press
+  // used to enter setup cannot immediately trigger setup exit.
+  if (g_configModeActive && g_requireConfigButtonReleaseForExit) {
+    if (stableState == HIGH) {
+      g_requireConfigButtonReleaseForExit = false;
+    } else {
+      return;
+    }
+  }
+
   // 1-second press on release: reconnect WiFi if not in config mode and not connected.
   if (stableState == HIGH && !longPressHandled && !g_configModeActive
       && pressDurationOnRelease >= CONFIG_RECONNECT_PRESS_MS
@@ -1101,7 +1147,9 @@ void handleConfigButtonLongPress() {
     startConfigMode();
   }
 
-  if (stableState == LOW && !longPressHandled && g_configModeActive && pressDurationMs >= CONFIG_EXIT_LONG_PRESS_MS) {
+  if (stableState == LOW && !longPressHandled && g_configModeActive
+      && (millis() - g_configModeEnteredMs) >= CONFIG_EXIT_ARM_DELAY_MS
+      && pressDurationMs >= CONFIG_EXIT_LONG_PRESS_MS) {
     longPressHandled = true;
     Serial.println("Config button long press detected. Leaving setup mode.");
     g_exitConfigModeRequested = true;
@@ -1443,7 +1491,10 @@ void setup(){
   delay(1000); 
   digitalWrite(MAGLOCK_RELAY, HIGH);
 
-  connectToConfiguredWiFi();
+  const bool wifiConnected = connectToConfiguredWiFi();
+  if (wifiConnected) {
+    probeWiFiInternetOnStartup();
+  }
   initRfidReader();
 
   initWatchdog();
@@ -1479,7 +1530,6 @@ void readWiegandInput() {
 void loop(){
 
   handleExitButtonPress();
-  handleConfigButtonLongPress();
 
   if (g_configModeActive) {
     updateConfigModeIndicators();
@@ -1495,9 +1545,14 @@ void loop(){
       stopConfigMode();
     }
 
+    // Keep watchdog alive while setup mode is active.
+    resetWatchdog();
     delay(2);
     return;
   }
+
+  // Only evaluate config button logic in normal runtime mode.
+  handleConfigButtonLongPress();
 
   handleTamperSwitch();
   readWiegandInput();
