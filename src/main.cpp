@@ -6,6 +6,9 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <map>
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 
 #include "secrets.h"
 
@@ -41,7 +44,10 @@ const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 14400000UL; // 5 minutes
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 14400000UL; // 4 hours
+
+const unsigned long HTTP_CONNECT_TIMEOUT_MS = 3000;
+const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -110,6 +116,59 @@ void emitShortBuzzer();
 void emitDoubleBuzzer();
 void handlePairingWiegandInput(const String &wiegandId);
 void applyAccessDecisionFromCache(const String &accessId);
+
+
+// === WATCHDOG ===
+inline void initWatchdog(uint32_t timeoutSec = 10) {
+  esp_task_wdt_init(timeoutSec, true);
+  esp_task_wdt_add(NULL);
+}
+
+inline void resetWatchdog() {
+  esp_task_wdt_reset();
+}
+
+inline void disableDeviceAutomaticSleep() {
+  // Disable automatic sleep
+  setCpuFrequencyMhz(240); // keep CPU at max frequency
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+}
+
+// === Print Module Stats ===
+inline void printModuleStats() {
+  Serial.println("=== ESP32 Module Stats ===");
+
+  // CPU & Chip Info
+  Serial.printf("Chip model: %s\n", ESP.getChipModel());
+  Serial.printf("Chip revision: %d\n", ESP.getChipRevision());
+  Serial.printf("Chip cores: %d\n", ESP.getChipCores());
+  Serial.printf("CPU frequency: %u MHz\n", ESP.getCpuFreqMHz());
+
+  // Memory
+  Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Min free heap: %u bytes\n", ESP.getMinFreeHeap());
+  Serial.printf("Max alloc block: %u bytes\n", ESP.getMaxAllocHeap());
+
+  // Flash & Sketch
+  Serial.printf("Flash size: %u bytes\n", ESP.getFlashChipSize());
+  Serial.printf("Sketch size: %u bytes\n", ESP.getSketchSize());
+  Serial.printf("Free sketch space: %u bytes\n", ESP.getFreeSketchSpace());
+
+  // Wi-Fi & Network
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Wi-Fi RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("MAC address: %s\n", WiFi.macAddress().c_str());
+  } else {
+    Serial.println("Wi-Fi not connected.");
+  }
+
+  // System
+  Serial.printf("Uptime: %lu ms\n", millis());
+  Serial.printf("Last reset reason: %d\n", esp_reset_reason());
+
+  Serial.println("===========================");
+}
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -282,7 +341,13 @@ void fetchAccessMappings() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
-  http.begin(API_URL);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  if (!http.begin(API_URL)) {
+    Serial.println("Unable to connect to server");
+    return;
+  }
+
   if (g_apiKey.length() > 0) {
     http.addHeader("X-API-Key", g_apiKey);
   }
@@ -1071,7 +1136,13 @@ void sendEventToServer(const String &eventAccessId) {
   }
 
   HTTPClient http;
-  http.begin(API_URL);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+  if (!http.begin(API_URL)) {
+    Serial.println("Unable to connect to server for event");
+    return;
+  }
+
   http.addHeader("Content-Type", "application/json");
   if (g_apiKey.length() > 0) {
     http.addHeader("X-API-Key", g_apiKey);
@@ -1200,7 +1271,14 @@ void sendToServer(const String &accessId, bool playProcessingFeedback) {
     changeoverControlTo("THIS_DEVICE");
 
     HTTPClient http;
-    http.begin(API_URL);
+    http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    if (!http.begin(API_URL)) {
+      Serial.println("Unable to connect to server");
+      applyAccessDecisionFromCache(accessId); // Fallback to cache if server connection fails
+      return;
+    }
+
     http.addHeader("Content-Type", "application/json");
     if (g_apiKey.length() > 0) {
       http.addHeader("X-API-Key", g_apiKey);
@@ -1277,6 +1355,9 @@ void setup(){
   WiFi.mode(WIFI_STA);
   delay(50);
 
+  // disable WiFi sleep to ensure timely server communication and consistent behavior of WiFi status indicators
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   loadRuntimeConfig();
 
   Serial.println("=== Setup AP config at boot ===");
@@ -1312,6 +1393,10 @@ void setup(){
 
   connectToConfiguredWiFi();
   initRfidReader();
+
+  initWatchdog();
+  disableDeviceAutomaticSleep();
+  printModuleStats();
 
 }
 
@@ -1375,6 +1460,8 @@ void loop(){
   if (CURRENT_LED_REJECTED_STATE == LOW) {
     updateIdleIndicator();
   }
+
+  resetWatchdog();
 
   delay(1);
 }
