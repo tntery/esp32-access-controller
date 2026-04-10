@@ -115,24 +115,24 @@ void applyAccessDecisionFromCache(const String &accessId);
 void changeoverControlTo(const char *str) {
   if (strcmp(str, "THIS_DEVICE") == 0) {
     // Connect maglock power to this device and exit button input to this device
-    // Energize all control relays to switch connections
-    digitalWrite(MAGLOCK_PWR_VCC_RALAY, HIGH);
-    if (MAGLOCK_PWR_GND_RALAY >= 0) {
-      digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
-    }
-    digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
-    digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
-    // Return LED control to normal runtime feedback flow.
-    Serial.println("Switched control to THIS_DEVICE");
-  } else if (strcmp(str, "EXTERNAL_CONTROLLER") == 0) {
-    // Connect maglock power to external controller and exit button input to external controller
-    // De-energize all control relays to switch connections
+    // Active-low relays: drive all control relays LOW to switch connections
     digitalWrite(MAGLOCK_PWR_VCC_RALAY, LOW);
     if (MAGLOCK_PWR_GND_RALAY >= 0) {
       digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
     }
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, LOW);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, LOW);
+    // Return LED control to normal runtime feedback flow.
+    Serial.println("Switched control to THIS_DEVICE");
+  } else if (strcmp(str, "EXTERNAL_CONTROLLER") == 0) {
+    // Connect maglock power to external controller and exit button input to external controller
+    // Active-low relays: drive all control relays HIGH to release connections
+    digitalWrite(MAGLOCK_PWR_VCC_RALAY, HIGH);
+    if (MAGLOCK_PWR_GND_RALAY >= 0) {
+      digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    }
+    digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
+    digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
     // External control indicator: processing and authorized LEDs ON.
     digitalWrite(LED_PROCESSING, HIGH);
     digitalWrite(LED_AUTHORIZED, HIGH);
@@ -852,11 +852,11 @@ void readRfidInput() {
 /////////////// Main access control logic below ////////////
 
 void unlockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, HIGH);
+  digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
 void lockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, LOW);
+  digitalWrite(MAGLOCK_RELAY, HIGH);
 }
 
 void feedbackProcessing(bool withBuzzer = true) {
@@ -1291,7 +1291,7 @@ void setup(){
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(MAGLOCK_RELAY, LOW);
+  digitalWrite(MAGLOCK_RELAY, HIGH);
 
   // test all outputs by turning them on for 1 second
   digitalWrite(LED_REJECTED, HIGH);
@@ -1306,9 +1306,9 @@ void setup(){
   digitalWrite(BUZZER, HIGH);
   delay(1000);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(MAGLOCK_RELAY, HIGH);
-  delay(1000); 
   digitalWrite(MAGLOCK_RELAY, LOW);
+  delay(1000); 
+  digitalWrite(MAGLOCK_RELAY, HIGH);
 
   connectToConfiguredWiFi();
   initRfidReader();
