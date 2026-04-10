@@ -3,6 +3,8 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <SPI.h>
+#include <MFRC522.h>
 #include <map>
 
 #include "secrets.h"
@@ -19,9 +21,16 @@ const int TAMPER_SWITCH_PIN = GPIO_NUM_26;
 const byte WIEGAND_D0_PIN = GPIO_NUM_32;
 const byte WIEGAND_D1_PIN = GPIO_NUM_33;
 
+// RC522 custom SPI pin map (uses GPIO16/GPIO17 as requested)
+const int RC522_SCK_PIN = GPIO_NUM_17;
+const int RC522_MISO_PIN = GPIO_NUM_34;
+const int RC522_MOSI_PIN = GPIO_NUM_16;
+const int RC522_SS_PIN = GPIO_NUM_23;
+const int RC522_RST_PIN = GPIO_NUM_2;
+
 // control device changeover pins
 const int MAGLOCK_PWR_VCC_RALAY = GPIO_NUM_19; 
-const int MAGLOCK_PWR_GND_RALAY = GPIO_NUM_23;
+const int MAGLOCK_PWR_GND_RALAY = -1; // relay removed
 const int EXIT_BUTTON_INPUT_PULLUP_RELAY = GPIO_NUM_21;
 const int EXIT_BUTTON_INPUT_GND_RELAY = GPIO_NUM_22;
 
@@ -32,7 +41,7 @@ const unsigned long CONFIG_RECONNECT_PRESS_MS = 1000;
 const unsigned long CONFIG_EXIT_LONG_PRESS_MS = 5000;
 const unsigned long CONFIG_MODE_IDLE_TIMEOUT_MS = 180000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 300000UL; // 5 minutes
+const unsigned long MAPPINGS_REFRESH_INTERVAL_MS = 14400000UL; // 5 minutes
 
 const char *CONFIG_AP_SSID = CONFIG_AP_SSID_DEFAULT;
 
@@ -56,10 +65,33 @@ unsigned long g_lastTamperToggleMs = 0;
 bool g_configLedBlinkState = false;
 unsigned long g_lastConfigLedBlinkMs = 0;
 
-std::map<uint32_t, bool> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
+// Idle indicator blink state (two short blinks + long break on LED_AUTHORIZED)
+uint8_t g_idleBlinkStep = 0;
+unsigned long g_lastIdleBlinkMs = 0;
+
+struct StringLess {
+  bool operator()(const String &lhs, const String &rhs) const {
+    return lhs.compareTo(rhs) < 0;
+  }
+};
+
+std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
 unsigned long g_lastMappingsFetchMs = 0;
 
-void sendToServer(uint32_t accessId);
+MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
+String g_lastRfidUidHex;
+unsigned long g_lastRfidReadMs = 0;
+
+const unsigned long RFID_REPEAT_IGNORE_MS = 1200;
+
+// Pairing mode state machine
+enum PairingState { PAIRING_IDLE, PAIRING_RFID_FIRST_TAP_BUFFERED, PAIRING_WAIT_WIEGAND };
+PairingState g_pairingState = PAIRING_IDLE;
+String g_pairingRfidUid;
+unsigned long g_pairingRfidFirstTapMs = 0;
+const unsigned long PAIRING_RFID_DOUBLE_TAP_WINDOW_MS = 600;  // 0.6 second to detect second tap before sending first tap
+
+void sendToServer(const String &accessId, bool playProcessingFeedback = true);
 void startConfigMode();
 void stopConfigMode();
 bool connectToConfiguredWiFi();
@@ -70,6 +102,14 @@ void feedbackReset();
 void handleConfigButtonLongPress();
 void updateConfigModeIndicators();
 void fetchAccessMappings();
+void initRfidReader();
+void readRfidInput();
+void sendEventToServer(const String &eventAccessId);
+String buildEventAccessId(const String &status);
+void emitShortBuzzer();
+void emitDoubleBuzzer();
+void handlePairingWiegandInput(const String &wiegandId);
+void applyAccessDecisionFromCache(const String &accessId);
 
 ////// CHANGEOVER CONTROL LOGIC BELOW //////////
 void changeoverControlTo(const char *str) {
@@ -77,7 +117,9 @@ void changeoverControlTo(const char *str) {
     // Connect maglock power to this device and exit button input to this device
     // Energize all control relays to switch connections
     digitalWrite(MAGLOCK_PWR_VCC_RALAY, HIGH);
-    digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    if (MAGLOCK_PWR_GND_RALAY >= 0) {
+      digitalWrite(MAGLOCK_PWR_GND_RALAY, HIGH);
+    }
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, HIGH);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, HIGH);
     // Return LED control to normal runtime feedback flow.
@@ -86,7 +128,9 @@ void changeoverControlTo(const char *str) {
     // Connect maglock power to external controller and exit button input to external controller
     // De-energize all control relays to switch connections
     digitalWrite(MAGLOCK_PWR_VCC_RALAY, LOW);
-    digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
+    if (MAGLOCK_PWR_GND_RALAY >= 0) {
+      digitalWrite(MAGLOCK_PWR_GND_RALAY, LOW);
+    }
     digitalWrite(EXIT_BUTTON_INPUT_PULLUP_RELAY, LOW);
     digitalWrite(EXIT_BUTTON_INPUT_GND_RELAY, LOW);
     // External control indicator: processing and authorized LEDs ON.
@@ -108,6 +152,28 @@ String htmlEscape(const String &value) {
   return escaped;
 }
 
+void logStringDebug(const char *label, const String &value) {
+  Serial.print(label);
+  Serial.print(" [");
+  Serial.print(value.length());
+  Serial.println(" chars]");
+  Serial.print("  quoted: >");
+  Serial.print(value);
+  Serial.println("<");
+  Serial.print("  bytes: ");
+  for (size_t i = 0; i < value.length(); i++) {
+    if (i > 0) {
+      Serial.print(' ');
+    }
+    uint8_t b = static_cast<uint8_t>(value[i]);
+    if (b < 16) {
+      Serial.print('0');
+    }
+    Serial.print(b, HEX);
+  }
+  Serial.println();
+}
+
 // Extracts the string value for a JSON key from a small JSON object snippet.
 String jsonExtractString(const String &obj, const String &key) {
   const String searchKey = "\"" + key + "\"";
@@ -121,17 +187,21 @@ String jsonExtractString(const String &obj, const String &key) {
   if (obj[valStart] == '"') {
     int end = obj.indexOf('"', valStart + 1);
     if (end < 0) return "";
-    return obj.substring(valStart + 1, end);
+    String extracted = obj.substring(valStart + 1, end);
+    extracted.trim();
+    return extracted;
   }
   int end = valStart;
   while (end < (int)obj.length() && obj[end] != ',' && obj[end] != '}' && obj[end] != ']') end++;
-  return obj.substring(valStart, end);
+  String extracted = obj.substring(valStart, end);
+  extracted.trim();
+  return extracted;
 }
 
 void saveMappingsToNvs() {
   String serialized;
   for (auto &entry : g_accessMappings) {
-    serialized += String(entry.first) + (entry.second ? ":1," : ":0,");
+    serialized += entry.first + (entry.second ? ":1," : ":0,");
   }
   if (serialized.endsWith(",")) {
     serialized.remove(serialized.length() - 1);
@@ -158,7 +228,8 @@ void loadMappingsFromNvs() {
     if (colonPos < 0) break;
     int commaPos = serialized.indexOf(',', colonPos + 1);
     if (commaPos < 0) commaPos = serialized.length();
-    uint32_t id = (uint32_t)serialized.substring(pos, colonPos).toInt();
+    String id = serialized.substring(pos, colonPos);
+    id.trim();
     bool isGrant = (serialized.charAt(colonPos + 1) == '1');
     g_accessMappings[id] = isGrant;
     pos = commaPos + 1;
@@ -179,7 +250,7 @@ void parseMappingsFromJson(const String &json) {
   int arrEnd = json.lastIndexOf(']');
   if (arrEnd <= arrStart) return;
 
-  std::map<uint32_t, bool> newMappings;
+  std::map<String, bool, StringLess> newMappings;
   int pos = arrStart;
   while (pos < arrEnd) {
     int objStart = json.indexOf('{', pos);
@@ -192,8 +263,7 @@ void parseMappingsFromJson(const String &json) {
     const String accStr = jsonExtractString(obj, "access");
 
     if (idStr.length() > 0 && accStr.length() > 0) {
-      uint32_t id = (uint32_t)idStr.toInt();
-      newMappings[id] = (accStr == "GRANT");
+      newMappings[idStr] = (accStr == "GRANT");
     }
     pos = objEnd + 1;
   }
@@ -240,12 +310,29 @@ void loadRuntimeConfig() {
   g_tamperEnabled = g_preferences.getBool("tamper_en", true);
   g_preferences.end();
 
+  // Normalize values loaded from NVS to avoid invisible whitespace issues.
+  const String apBefore = g_configApPassword;
+  const String webBefore = g_configWebPassword;
+  g_configApPassword.trim();
+  g_configWebPassword.trim();
+
+  bool configUpdated = (g_configApPassword != apBefore) || (g_configWebPassword != webBefore);
+
   if (g_configApPassword.length() < 8 || g_configApPassword.length() > 63) {
     g_configApPassword = CONFIG_AP_PASSWORD_DEFAULT;
+    configUpdated = true;
   }
 
   if (g_configWebPassword.length() < 4 || g_configWebPassword.length() > 63) {
     g_configWebPassword = CONFIG_WEB_PASSWORD_DEFAULT;
+    configUpdated = true;
+  }
+
+  if (configUpdated) {
+    g_preferences.begin("accesscfg", false);
+    g_preferences.putString("ap_pass", g_configApPassword);
+    g_preferences.putString("web_pass", g_configWebPassword);
+    g_preferences.end();
   }
   loadMappingsFromNvs();
 }
@@ -263,6 +350,24 @@ void saveRuntimeConfig() {
 
 String buildConfigPageHtml(const String &message) {
   const String checked = g_tamperEnabled ? "checked" : "";
+  const String apIp = WiFi.softAPIP().toString();
+  const String staIp = WiFi.localIP().toString();
+  const String staMac = WiFi.macAddress();
+  const String apMac = WiFi.softAPmacAddress();
+  const String wifiStatus = (WiFi.status() == WL_CONNECTED) ? "Connected" : "Not connected";
+
+  const String deviceInfo =
+    "<div style='margin:12px 0;padding:10px;border:1px solid #ddd;background:#f7f7f7;'>"
+    "<strong>Device Info</strong>"
+    "<div style='margin-top:8px;font-size:14px;line-height:1.5;'>"
+    "<div><b>Setup AP SSID:</b> " + htmlEscape(String(CONFIG_AP_SSID)) + "</div>"
+    "<div><b>Setup AP IP:</b> " + htmlEscape(apIp) + "</div>"
+    "<div><b>Setup AP MAC:</b> " + htmlEscape(apMac) + "</div>"
+    "<div><b>STA IP:</b> " + htmlEscape(staIp) + "</div>"
+    "<div><b>STA MAC:</b> " + htmlEscape(staMac) + "</div>"
+    "<div><b>WiFi Status:</b> " + htmlEscape(wifiStatus) + "</div>"
+    "</div></div>";
+
   const String html =
     "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>Access Controller Setup</title>"
@@ -274,12 +379,13 @@ String buildConfigPageHtml(const String &message) {
     ".row{margin-top:12px;display:flex;align-items:center;gap:10px;}</style></head><body>"
     "<h2>Access Controller Setup</h2>"
     "<p>Device is in setup mode. It returns to normal mode after idle timeout.</p>" +
+    deviceInfo +
     (message.length() ? ("<div class='msg'>" + htmlEscape(message) + "</div>") : String("")) +
     "<form method='POST' action='/save'>"
     "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(g_wifiSsid) + "' required>"
     "<label>WiFi Password</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
-    "<label>Setup AP Password (8-63 chars)</label><input type='password' name='ap_password' value='" + htmlEscape(g_configApPassword) + "' minlength='8' maxlength='63' required>"
-    "<label>Setup Page Password (4-63 chars)</label><input type='password' name='web_password' value='" + htmlEscape(g_configWebPassword) + "' minlength='4' maxlength='63' required>"
+    "<label>Setup AP Password (8-63 chars, leave blank to keep current)</label><input type='password' name='ap_password' value='' minlength='8' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
+    "<label>Setup Page Password (4-63 chars, leave blank to keep current)</label><input type='password' name='web_password' value='' minlength='4' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
     "<label>API Key</label><input name='api_key' value='" + htmlEscape(g_apiKey) + "'>"
     "<div class='row'><input id='tamper' type='checkbox' name='tamper_enabled' " + checked + ">"
     "<label for='tamper' style='margin:0;font-weight:400;'>Enable tamper detection</label><span>Enable tamper detection</span></div>"
@@ -308,24 +414,37 @@ void configureWebRoutes() {
     g_wifiSsid = g_webServer.arg("ssid");
     g_wifiPassword = g_webServer.arg("password");
     g_apiKey = g_webServer.arg("api_key");
-    const String requestedApPassword = g_webServer.arg("ap_password");
-    const String requestedWebPassword = g_webServer.arg("web_password");
+    String requestedApPassword = g_webServer.arg("ap_password");
+    String requestedWebPassword = g_webServer.arg("web_password");
+    requestedApPassword.trim();
+    requestedWebPassword.trim();
+    const bool previousTamperEnabled = g_tamperEnabled;
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
 
-    if (requestedApPassword.length() < 8 || requestedApPassword.length() > 63) {
+    if (requestedApPassword.length() > 0 && (requestedApPassword.length() < 8 || requestedApPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
       return;
     }
 
-    if (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63) {
+    if (requestedWebPassword.length() > 0 && (requestedWebPassword.length() < 4 || requestedWebPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("Page password must be 4 to 63 characters."));
       return;
     }
 
-    g_configApPassword = requestedApPassword;
-    g_configWebPassword = requestedWebPassword;
+    if (requestedApPassword.length() > 0) {
+      g_configApPassword = requestedApPassword;
+    }
+
+    if (requestedWebPassword.length() > 0) {
+      g_configWebPassword = requestedWebPassword;
+    }
 
     saveRuntimeConfig();
+
+    if (previousTamperEnabled != g_tamperEnabled) {
+      sendEventToServer(buildEventAccessId(g_tamperEnabled ? "TAMPER_CFG_ENABLED" : "TAMPER_CFG_DISABLED"));
+    }
+
     g_webServer.send(200, "text/html", buildConfigPageHtml("Saved successfully. Leaving setup mode now."));
     g_exitConfigModeRequested = true;
   });
@@ -375,12 +494,12 @@ bool connectToConfiguredWiFi() {
   }
 
   Serial.println("WiFi connection failed within timeout");
-  changeoverControlTo("EXTERNAL_CONTROLLER");
+  changeoverControlTo("THIS_DEVICE");
 
-  // On connection failure, show external-control style LEDs.
-  digitalWrite(LED_REJECTED, LOW);
-  digitalWrite(LED_PROCESSING, HIGH);
-  digitalWrite(LED_AUTHORIZED, HIGH);
+  // Keep this device in control on connection failure.
+  digitalWrite(LED_REJECTED, HIGH);
+  digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
   CURRENT_LED_REJECTED_STATE = LOW;
   return false;
 }
@@ -398,14 +517,41 @@ void startConfigMode() {
   g_configLedBlinkState = false;
 
   lockMaglock();
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_AP);
+  Serial.println("=== Setup AP startup parameters ===");
+  logStringDebug("AP SSID (runtime)", String(CONFIG_AP_SSID));
+  logStringDebug("AP password (runtime before trim)", g_configApPassword);
+  logStringDebug("AP password (default macro)", String(CONFIG_AP_PASSWORD_DEFAULT));
 
-  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, g_configApPassword.c_str());
+  String apPassword = g_configApPassword;
+  apPassword.trim();
+  if (apPassword.length() < 8 || apPassword.length() > 63) {
+    apPassword = CONFIG_AP_PASSWORD_DEFAULT;
+  }
+
+  logStringDebug("AP password (used by softAP)", apPassword);
+  Serial.println("AP channel (default): 1");
+  Serial.println("AP hidden (default): 0");
+  Serial.println("AP max connections (default): 4");
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  delay(100);
+
+  const bool apStarted = WiFi.softAP(CONFIG_AP_SSID, apPassword.c_str());
+  g_configApPassword = apPassword;
+  Serial.print("ESP32 STA MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("ESP32 AP MAC: ");
+  Serial.println(WiFi.softAPmacAddress());
   Serial.print("Setup AP SSID: ");
   Serial.println(CONFIG_AP_SSID);
   Serial.print("Setup AP protected: ");
   Serial.println(apStarted ? "YES" : "FAILED");
+  Serial.print("Setup AP password length: ");
+  Serial.println(g_configApPassword.length());
   Serial.print("Setup portal IP: ");
   Serial.println(WiFi.softAPIP());
 
@@ -564,7 +710,13 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
 
-    sendToServer(accessId);
+    String wiegandStr = String(accessId);
+    if (g_pairingState == PAIRING_WAIT_WIEGAND) {
+      handlePairingWiegandInput(wiegandStr);
+    } else {
+      emitShortBuzzer();
+      sendToServer(wiegandStr, false);
+    }
 
   } else if (bitCount == 34) {
     const uint32_t accessId = bitsToUint32(bits, 1, 32);
@@ -575,12 +727,127 @@ void decodeAndPrint(const uint8_t *bits, uint8_t bitCount) {
     Serial.println(accessId);
     Serial.print("Parity: ");
     Serial.println(parityOk ? "OK" : "FAIL");
+
+    String wiegandStr = String(accessId);
+    if (g_pairingState == PAIRING_WAIT_WIEGAND) {
+      handlePairingWiegandInput(wiegandStr);
+    } else {
+      emitShortBuzzer();
+      sendToServer(wiegandStr, false);
+    }
   } else {
     Serial.println("Format: Unknown/Custom");
   }
 }
 
 /// end of Wiegand decoding logic //////
+
+String uidToHexString(const MFRC522::Uid &uid) {
+  String hex;
+  for (byte i = 0; i < uid.size; i++) {
+    if (uid.uidByte[i] < 0x10) {
+      hex += "0";
+    }
+    hex += String(uid.uidByte[i], HEX);
+  }
+  hex.toUpperCase();
+  return hex;
+}
+
+void initRfidReader() {
+  SPI.begin(RC522_SCK_PIN, RC522_MISO_PIN, RC522_MOSI_PIN, RC522_SS_PIN);
+  g_mfrc522.PCD_Init();
+  delay(50);
+
+  Serial.println("RC522 initialized");
+  Serial.print("  SCK=");
+  Serial.println(RC522_SCK_PIN);
+  Serial.print("  MISO=");
+  Serial.println(RC522_MISO_PIN);
+  Serial.print("  MOSI=");
+  Serial.println(RC522_MOSI_PIN);
+  Serial.print("  SS=");
+  Serial.println(RC522_SS_PIN);
+  Serial.print("  RST=");
+  Serial.println(RC522_RST_PIN);
+}
+
+void readRfidInput() {
+  const unsigned long now = millis();
+
+  // First tap buffered: waiting for potential second tap within 1 second
+  if (g_pairingState == PAIRING_RFID_FIRST_TAP_BUFFERED && g_pairingRfidFirstTapMs > 0) {
+    const unsigned long elapsedSinceFirstTap = now - g_pairingRfidFirstTapMs;
+    
+    // Check for second card detection
+    if (g_mfrc522.PICC_IsNewCardPresent() && g_mfrc522.PICC_ReadCardSerial()) {
+      const String uidHex = uidToHexString(g_mfrc522.uid);
+      if (uidHex == g_pairingRfidUid && elapsedSinceFirstTap < PAIRING_RFID_DOUBLE_TAP_WINDOW_MS) {
+        // Second tap detected within 1 second! Enter pairing mode WITHOUT sending first tap
+        g_pairingState = PAIRING_WAIT_WIEGAND;
+        g_pairingRfidFirstTapMs = 0;
+        Serial.println("=== Second tap detected within 1s; Pairing Mode activated ===");
+        Serial.println("Waiting for Wiegand input...");
+        emitDoubleBuzzer();
+        g_mfrc522.PICC_HaltA();
+        g_mfrc522.PCD_StopCrypto1();
+        return;
+      } else {
+        // Different card or window expired; send buffered first tap and process this new card
+        g_mfrc522.PICC_HaltA();
+        g_mfrc522.PCD_StopCrypto1();
+        // Fall through to send buffered first tap
+      }
+    }
+    
+    // Check if window has expired without second tap
+    if (elapsedSinceFirstTap > PAIRING_RFID_DOUBLE_TAP_WINDOW_MS) {
+      // Double-tap window expired; send the buffered first tap to server
+      Serial.println("No second tap; sending initial access to server.");
+      sendToServer(g_pairingRfidUid, false);
+      g_pairingState = PAIRING_IDLE;
+      g_pairingRfidUid = "";
+      g_pairingRfidFirstTapMs = 0;
+      return;
+    }
+    
+    // Still within window and no card present; wait
+    return;
+  }
+
+  // Normal card detection (PAIRING_IDLE or new card during buffering)
+  if (!g_mfrc522.PICC_IsNewCardPresent() || !g_mfrc522.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  const String uidHex = uidToHexString(g_mfrc522.uid);
+  
+  // Ignore repeated reads of same card within repeat window
+  if (uidHex == g_lastRfidUidHex && (now - g_lastRfidReadMs) < RFID_REPEAT_IGNORE_MS) {
+    g_mfrc522.PICC_HaltA();
+    g_mfrc522.PCD_StopCrypto1();
+    return;
+  }
+
+  g_lastRfidUidHex = uidHex;
+  g_lastRfidReadMs = now;
+
+  // First tap detected: buffer it and enable double-tap detection window
+  Serial.print("RFID UID=");
+  Serial.print(uidHex);
+  Serial.print(" access_id=");
+  Serial.println(uidHex);
+  Serial.println("  [Tap again within 1s to enter pairing mode]");
+  emitShortBuzzer();  // Immediate feedback that card was detected
+  
+  // Buffer first tap instead of sending immediately
+  g_pairingState = PAIRING_RFID_FIRST_TAP_BUFFERED;
+  g_pairingRfidUid = uidHex;
+  g_pairingRfidFirstTapMs = now;
+
+  g_mfrc522.PICC_HaltA();
+  g_mfrc522.PCD_StopCrypto1();
+}
 
 /////////////// Main access control logic below ////////////
 
@@ -592,10 +859,16 @@ void lockMaglock() {
   digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
-void feedbackProcessing() {
+void feedbackProcessing(bool withBuzzer = true) {
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(LED_PROCESSING, HIGH);
+  if (withBuzzer) {
+    // Short single beep on access event detection
+    digitalWrite(BUZZER, HIGH);
+    delay(80);
+    digitalWrite(BUZZER, LOW);
+  }
 }
 
 void grant() {
@@ -628,6 +901,8 @@ void grant() {
 void feedbackReject(bool idle = false) {
   // provide feedback for rejected access
   digitalWrite(LED_PROCESSING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);  // ensure idle blink LED is off
+  g_idleBlinkStep = 0;
   digitalWrite(LED_REJECTED, HIGH);
 
   CURRENT_LED_REJECTED_STATE = HIGH;
@@ -643,6 +918,10 @@ void feedbackReject(bool idle = false) {
     digitalWrite(BUZZER, LOW);
     delay(80);
   }
+
+  // Return to idle indicator behavior after rejection feedback completes.
+  digitalWrite(LED_REJECTED, LOW);
+  CURRENT_LED_REJECTED_STATE = LOW;
 
 }
 
@@ -758,6 +1037,113 @@ void updateConfigModeIndicators() {
   }
 }
 
+// Two short blinks (120 ms on / 120 ms off) followed by a 1600 ms break on LED_AUTHORIZED.
+void updateIdleIndicator() {
+  // Steps: 0=blink1 on, 1=blink1 off, 2=blink2 on, 3=blink2 off (long break)
+  const unsigned long stepDurations[4] = { 150, 400, 150, 3000 };
+  const unsigned long now = millis();
+
+  if ((now - g_lastIdleBlinkMs) >= stepDurations[g_idleBlinkStep]) {
+    g_lastIdleBlinkMs = now;
+    g_idleBlinkStep = (g_idleBlinkStep + 1) % 4;
+    // Steps 0 and 2 are the ON phases for idle pattern.
+    const int idleOn = (g_idleBlinkStep == 0 || g_idleBlinkStep == 2) ? HIGH : LOW;
+    digitalWrite(LED_AUTHORIZED, idleOn);
+
+    // When WiFi is down, blink rejected LED together with authorized LED.
+    if (WiFi.status() != WL_CONNECTED) {
+      digitalWrite(LED_REJECTED, idleOn);
+    } else {
+      digitalWrite(LED_REJECTED, LOW);
+    }
+  }
+}
+
+String buildEventAccessId(const String &status) {
+  return status + "+" + String(millis());
+}
+
+void sendEventToServer(const String &eventAccessId) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("Event not sent, WiFi not connected: ");
+    Serial.println(eventAccessId);
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(API_URL);
+  http.addHeader("Content-Type", "application/json");
+  if (g_apiKey.length() > 0) {
+    http.addHeader("X-API-Key", g_apiKey);
+  }
+
+  String payload = "{\"access_id\":\"" + eventAccessId + "\"}";
+  const int httpResponseCode = http.POST(payload);
+
+  Serial.print("Event POST access_id=");
+  Serial.print(eventAccessId);
+  Serial.print(" HTTP=");
+  Serial.println(httpResponseCode);
+
+  http.end();
+}
+
+void emitShortBuzzer() {
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+}
+
+void emitDoubleBuzzer() {
+  // Two quick beeps: 80ms on, 80ms off, 80ms on, 80ms off
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+  delay(80);
+  digitalWrite(BUZZER, HIGH);
+  delay(80);
+  digitalWrite(BUZZER, LOW);
+}
+
+void handlePairingWiegandInput(const String &wiegandId) {
+  if (g_pairingState != PAIRING_WAIT_WIEGAND) {
+    return;  // Not in pairing mode, ignore
+  }
+
+  // Build paired ID: "CARD-rfiduid-WIEGAND-wiegandid"
+  String pairedId = "CARD-" + g_pairingRfidUid + "-WIEGAND-" + wiegandId;
+  
+  Serial.print("=== Pairing Complete: ");
+  Serial.println(pairedId);
+  
+  // Emit second double buzzer to confirm
+  emitDoubleBuzzer();
+  
+  // Reset pairing state
+  g_pairingState = PAIRING_IDLE;
+  g_pairingRfidUid = "";
+  
+  // Send the paired ID to server
+  sendToServer(pairedId, false);
+}
+
+void applyAccessDecisionFromCache(const String &accessId) {
+  auto it = g_accessMappings.find(accessId);
+  if (it != g_accessMappings.end()) {
+    Serial.print("Cache fallback for ID ");
+    Serial.print(accessId);
+    Serial.println(it->second ? ": GRANT" : ": REJECT");
+    if (it->second) {
+      grant();
+    } else {
+      feedbackReject();
+    }
+  } else {
+    Serial.println("No cached decision for this ID. Rejecting.");
+    feedbackReject();
+  }
+}
+
 void handleTamperSwitch() {
   static int lastReading = LOW;
   static int stableState = LOW;
@@ -789,11 +1175,13 @@ void handleTamperSwitch() {
       g_tamperBuzzerState = true;
       g_lastTamperToggleMs = millis();
       digitalWrite(BUZZER, HIGH);
+      sendEventToServer(buildEventAccessId("TAMPER_OPEN"));
     } else {
       Serial.println("Tamper switch restored. Stopping buzzer alarm.");
       g_tamperAlarmActive = false;
       g_tamperBuzzerState = false;
       digitalWrite(BUZZER, LOW);
+      sendEventToServer(buildEventAccessId("TAMPER_RESTORED"));
     }
   }
 
@@ -804,7 +1192,9 @@ void handleTamperSwitch() {
   }
 }
 
-void sendToServer(uint32_t accessId) {
+void sendToServer(const String &accessId, bool playProcessingFeedback) {
+  Serial.print("Processing access ID: ");
+  Serial.println(accessId);
   if (WiFi.status() == WL_CONNECTED) {
 
     changeoverControlTo("THIS_DEVICE");
@@ -816,8 +1206,8 @@ void sendToServer(uint32_t accessId) {
       http.addHeader("X-API-Key", g_apiKey);
     }
 
-    String payload = "{\"access_id\":\"" + String(accessId) + "\"}";
-    feedbackProcessing();
+    String payload = "{\"access_id\":\"" + accessId + "\"}";
+    feedbackProcessing(playProcessingFeedback);
     int httpResponseCode = http.POST(payload);
 
     if (httpResponseCode > 0) {
@@ -839,25 +1229,14 @@ void sendToServer(uint32_t accessId) {
     Serial.print("POST failed, HTTP: ");
     Serial.println(httpResponseCode);
 
-    // Fallback: use cached decision when server is unreachable or WiFi is down.
-    auto it = g_accessMappings.find(accessId);
-    if (it != g_accessMappings.end()) {
-      Serial.print("Cache fallback for ID ");
-      Serial.print(accessId);
-      Serial.println(it->second ? ": GRANT" : ": REJECT");
-      if (it->second) {
-        grant();
-      } else {
-        feedbackReject();
-      }
-    } else {
-      Serial.println("No cached decision for this ID. Rejecting.");
-      feedbackReject();
-    }
+    // Fallback: use cached decision when server is unreachable.
+    applyAccessDecisionFromCache(accessId);
 
   } else {
     Serial.println("WiFi not connected.");
-    changeoverControlTo("EXTERNAL_CONTROLLER");
+    changeoverControlTo("THIS_DEVICE");
+    feedbackProcessing(playProcessingFeedback);
+    applyAccessDecisionFromCache(accessId);
   }
 
 }
@@ -876,12 +1255,16 @@ void setup(){
   pinMode(WIEGAND_D0_PIN, INPUT_PULLUP);
   pinMode(WIEGAND_D1_PIN, INPUT_PULLUP);
 
-  // Set changeover control pins to OUTPUT and initialize to default state (connected to external controller) 
+  // Set changeover control pins to OUTPUT and keep control with this device from boot.
   pinMode(MAGLOCK_PWR_VCC_RALAY, OUTPUT);
-  pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
+  if (MAGLOCK_PWR_GND_RALAY >= 0) {
+    pinMode(MAGLOCK_PWR_GND_RALAY, OUTPUT);
+  }
   pinMode(EXIT_BUTTON_INPUT_PULLUP_RELAY, OUTPUT);
   pinMode(EXIT_BUTTON_INPUT_GND_RELAY, OUTPUT);
-  changeoverControlTo("EXTERNAL_CONTROLLER");
+  pinMode(RC522_RST_PIN, OUTPUT);
+  pinMode(RC522_SS_PIN, OUTPUT);
+  changeoverControlTo("THIS_DEVICE");
 
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D0_PIN), onD0Pulse, FALLING);
   attachInterrupt(digitalPinToInterrupt(WIEGAND_D1_PIN), onD1Pulse, FALLING);
@@ -889,7 +1272,19 @@ void setup(){
   // Initialize serial
   Serial.begin(115200);
 
+  // Avoid WiFi driver persisting stale AP/STA configuration across reboots.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  delay(50);
+
   loadRuntimeConfig();
+
+  Serial.println("=== Setup AP config at boot ===");
+  Serial.print("ESP32 STA MAC: ");
+  Serial.println(WiFi.macAddress());
+  logStringDebug("AP SSID (macro)", String(CONFIG_AP_SSID));
+  logStringDebug("AP password (loaded runtime)", g_configApPassword);
+  logStringDebug("AP password (default macro)", String(CONFIG_AP_PASSWORD_DEFAULT));
 
   // Initialize all LEDs and buzzer to LOW
   digitalWrite(LED_PROCESSING, LOW);
@@ -916,6 +1311,7 @@ void setup(){
   digitalWrite(MAGLOCK_RELAY, LOW);
 
   connectToConfiguredWiFi();
+  initRfidReader();
 
 }
 
@@ -968,6 +1364,7 @@ void loop(){
 
   handleTamperSwitch();
   readWiegandInput();
+  readRfidInput();
 
   // Periodically refresh access mappings from server.
   if (WiFi.status() == WL_CONNECTED &&
@@ -975,8 +1372,8 @@ void loop(){
     fetchAccessMappings();
   }
 
-  if (CURRENT_LED_REJECTED_STATE == LOW && WiFi.status() == WL_CONNECTED) {
-    digitalWrite(LED_REJECTED, HIGH);
+  if (CURRENT_LED_REJECTED_STATE == LOW) {
+    updateIdleIndicator();
   }
 
   delay(1);
