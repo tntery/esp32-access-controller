@@ -78,6 +78,9 @@ struct StringLess {
 std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
 unsigned long g_lastMappingsFetchMs = 0;
 
+const char *ACL_CACHE_KEY = "acl_cache";
+const char *ACL_CACHE_BACKUP_KEY = "acl_cache_bak";
+
 MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
 String g_lastRfidUidHex;
 unsigned long g_lastRfidReadMs = 0;
@@ -102,6 +105,9 @@ void feedbackReset();
 void handleConfigButtonLongPress();
 void updateConfigModeIndicators();
 void fetchAccessMappings();
+bool scanForConfiguredWiFi();
+void onWiFiEvent(WiFiEvent_t event);
+const char *getWiFiEventString(WiFiEvent_t event);
 void initRfidReader();
 void readRfidInput();
 void sendEventToServer(const String &eventAccessId);
@@ -206,8 +212,15 @@ void saveMappingsToNvs() {
   if (serialized.endsWith(",")) {
     serialized.remove(serialized.length() - 1);
   }
+
+  if (serialized.length() == 0) {
+    Serial.println("Skipping write of empty ACL cache to NVS; preserving existing cache.");
+    return;
+  }
+
   g_preferences.begin("accesscfg", false);
-  g_preferences.putString("acl_cache", serialized);
+  g_preferences.putString(ACL_CACHE_KEY, serialized);
+  g_preferences.putString(ACL_CACHE_BACKUP_KEY, serialized);
   g_preferences.end();
   Serial.print("Saved ");
   Serial.print(g_accessMappings.size());
@@ -216,8 +229,26 @@ void saveMappingsToNvs() {
 
 void loadMappingsFromNvs() {
   g_preferences.begin("accesscfg", true);
-  String serialized = g_preferences.getString("acl_cache", "");
-  g_preferences.end();
+  String serialized = g_preferences.getString(ACL_CACHE_KEY, "");
+  if (serialized.length() == 0) {
+    serialized = g_preferences.getString(ACL_CACHE_BACKUP_KEY, "");
+    if (serialized.length() > 0) {
+      Serial.println("Primary ACL cache missing; restoring from backup.");
+      Serial.print("ACL cache raw data from backup NVS: ");
+      Serial.println(serialized);
+      g_preferences.end();
+      g_preferences.begin("accesscfg", false);
+      g_preferences.putString(ACL_CACHE_KEY, serialized);
+      g_preferences.end();
+    } else {
+      g_preferences.end();
+      Serial.println("ACL cache load: no data found in NVS.");
+    }
+  } else {
+    Serial.print("ACL cache raw data from NVS: ");
+    Serial.println(serialized);
+    g_preferences.end();
+  }
 
   g_accessMappings.clear();
   if (serialized.length() == 0) return;
@@ -348,6 +379,8 @@ void loadRuntimeConfig() {
   g_preferences.end();
 
   // Normalize values loaded from NVS to avoid invisible whitespace issues.
+  g_wifiSsid.trim();
+  g_wifiPassword.trim();
   const String apBefore = g_configApPassword;
   const String webBefore = g_configWebPassword;
   g_configApPassword.trim();
@@ -383,6 +416,28 @@ void saveRuntimeConfig() {
   g_preferences.putString("web_pass", g_configWebPassword);
   g_preferences.putBool("tamper_en", g_tamperEnabled);
   g_preferences.end();
+}
+
+const char *getWiFiEventString(WiFiEvent_t event) {
+  switch (event) {
+    case SYSTEM_EVENT_WIFI_READY: return "WIFI_READY";
+    case SYSTEM_EVENT_SCAN_DONE: return "SCAN_DONE";
+    case SYSTEM_EVENT_STA_START: return "STA_START";
+    case SYSTEM_EVENT_STA_STOP: return "STA_STOP";
+    case SYSTEM_EVENT_STA_CONNECTED: return "STA_CONNECTED";
+    case SYSTEM_EVENT_STA_DISCONNECTED: return "STA_DISCONNECTED";
+    case SYSTEM_EVENT_STA_AUTHMODE_CHANGE: return "STA_AUTHMODE_CHANGE";
+    case SYSTEM_EVENT_STA_GOT_IP: return "STA_GOT_IP";
+    case SYSTEM_EVENT_STA_LOST_IP: return "STA_LOST_IP";
+    default: return "UNKNOWN_EVENT";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event) {
+  // Serial.print("WiFi event: ");
+  // Serial.print((int)event);
+  // Serial.print(" ");
+  // Serial.println(getWiFiEventString(event));
 }
 
 String buildConfigPageHtml(const String &message) {
@@ -449,14 +504,19 @@ void configureWebRoutes() {
     g_configModeLastActivityMs = millis();
 
     g_wifiSsid = g_webServer.arg("ssid");
-    g_wifiPassword = g_webServer.arg("password");
+    String requestedWifiPassword = g_webServer.arg("password");
     g_apiKey = g_webServer.arg("api_key");
     String requestedApPassword = g_webServer.arg("ap_password");
     String requestedWebPassword = g_webServer.arg("web_password");
+    requestedWifiPassword.trim();
     requestedApPassword.trim();
     requestedWebPassword.trim();
     const bool previousTamperEnabled = g_tamperEnabled;
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
+
+    if (requestedWifiPassword.length() > 0) {
+      g_wifiPassword = requestedWifiPassword;
+    }
 
     if (requestedApPassword.length() > 0 && (requestedApPassword.length() < 8 || requestedApPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
@@ -487,6 +547,54 @@ void configureWebRoutes() {
   });
 }
 
+bool scanForConfiguredWiFi() {
+  Serial.println("Scanning for configured WiFi SSID...");
+  const int n = WiFi.scanNetworks(false, true);
+  if (n == 0) {
+    Serial.println("No WiFi networks found.");
+    return false;
+  }
+
+  Serial.print("Found ");
+  Serial.print(n);
+  Serial.println(" WiFi networks:");
+
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    const String ssid = WiFi.SSID(i);
+    const int32_t rssi = WiFi.RSSI(i);
+    const int32_t channel = WiFi.channel(i);
+    const int authType = WiFi.encryptionType(i);
+    const char *authLabel = "UNKNOWN";
+    switch (authType) {
+      case WIFI_AUTH_OPEN: authLabel = "OPEN"; break;
+      case WIFI_AUTH_WEP: authLabel = "WEP"; break;
+      case WIFI_AUTH_WPA_PSK: authLabel = "WPA_PSK"; break;
+      case WIFI_AUTH_WPA2_PSK: authLabel = "WPA2_PSK"; break;
+      case WIFI_AUTH_WPA_WPA2_PSK: authLabel = "WPA_WPA2_PSK"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: authLabel = "WPA2_ENTERPRISE"; break;
+      case WIFI_AUTH_WPA3_PSK: authLabel = "WPA3_PSK"; break;
+      case WIFI_AUTH_WPA2_WPA3_PSK: authLabel = "WPA2_WPA3_PSK"; break;
+      default: authLabel = "UNKNOWN"; break;
+    }
+    Serial.print("  ");
+    Serial.print(i + 1);
+    Serial.print(". SSID='" + ssid + "' RSSI=");
+    Serial.print(rssi);
+    Serial.print(" dBm channel=");
+    Serial.print(channel);
+    Serial.print(" auth=");
+    Serial.println(authLabel);
+    if (ssid == g_wifiSsid) {
+      Serial.println("    --> Configured SSID found.");
+      found = true;
+    }
+  }
+
+  WiFi.scanDelete();
+  return found;
+}
+
 bool connectToConfiguredWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
@@ -500,6 +608,12 @@ bool connectToConfiguredWiFi() {
   Serial.print("Connecting to WiFi SSID: ");
   Serial.println(g_wifiSsid);
   Serial.print("Connecting to WiFi");
+  Serial.print(" using password: ");
+  Serial.println(g_wifiPassword);
+
+  if (!scanForConfiguredWiFi()) {
+    Serial.println("WARNING: Configured SSID was not found in scan.");
+  }
 
   WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
 
@@ -514,6 +628,12 @@ bool connectToConfiguredWiFi() {
   digitalWrite(LED_PROCESSING, LOW);
 
   Serial.println("");
+  Serial.print("Final WiFi.status(): ");
+  Serial.println(WiFi.status());
+  Serial.print("Current SSID: ");
+  Serial.println(WiFi.SSID());
+  Serial.print("Current RSSI: ");
+  Serial.println(WiFi.RSSI());
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi connected");
@@ -1380,6 +1500,7 @@ void setup(){
   // Avoid WiFi driver persisting stale AP/STA configuration across reboots.
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.onEvent(onWiFiEvent);
   delay(50);
 
   loadRuntimeConfig();
