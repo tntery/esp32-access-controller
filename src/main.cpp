@@ -79,7 +79,11 @@ std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true
 unsigned long g_lastMappingsFetchMs = 0;
 
 const char *ACL_CACHE_KEY = "acl_cache";
+const char *ACL_CACHE_HASH_KEY = "acl_cache_hash";
+const char *ACL_CACHE_COMMIT_KEY = "acl_cache_ok";
 const char *ACL_CACHE_BACKUP_KEY = "acl_cache_bak";
+const char *ACL_CACHE_BAK_HASH_KEY = "acl_cache_bak_hash";
+const char *ACL_CACHE_BAK_COMMIT_KEY = "acl_cache_bak_ok";
 
 MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
 String g_lastRfidUidHex;
@@ -204,6 +208,41 @@ String jsonExtractString(const String &obj, const String &key) {
   return extracted;
 }
 
+uint32_t computeCacheHash(const String &value) {
+  uint32_t hash = 5381;
+  for (int i = 0; i < value.length(); i++) {
+    hash = ((hash << 5) + hash) + static_cast<uint8_t>(value[i]);
+  }
+  return hash;
+}
+
+bool validateCacheEntry(const char *cacheKey, const char *hashKey, const char *commitKey, String &outValue) {
+  g_preferences.begin("accesscfg", true);
+  const bool isCommitted = g_preferences.getBool(commitKey, false);
+  outValue = g_preferences.getString(cacheKey, "");
+  const String storedHash = g_preferences.getString(hashKey, "");
+  g_preferences.end();
+
+  if (!isCommitted || outValue.length() == 0 || storedHash.length() == 0) {
+    return false;
+  }
+
+  const uint32_t expectedHash = computeCacheHash(outValue);
+  return storedHash.toInt() == expectedHash;
+}
+
+void saveCacheEntry(const char *cacheKey, const char *hashKey, const char *commitKey, const String &serialized) {
+  const uint32_t hash = computeCacheHash(serialized);
+  const String hashStr = String(hash);
+
+  g_preferences.begin("accesscfg", false);
+  g_preferences.putBool(commitKey, false);
+  g_preferences.putString(cacheKey, serialized);
+  g_preferences.putString(hashKey, hashStr);
+  g_preferences.putBool(commitKey, true);
+  g_preferences.end();
+}
+
 void saveMappingsToNvs() {
   String serialized;
   for (auto &entry : g_accessMappings) {
@@ -218,41 +257,34 @@ void saveMappingsToNvs() {
     return;
   }
 
-  g_preferences.begin("accesscfg", false);
-  g_preferences.putString(ACL_CACHE_KEY, serialized);
-  g_preferences.putString(ACL_CACHE_BACKUP_KEY, serialized);
-  g_preferences.end();
+  saveCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized);
+  saveCacheEntry(ACL_CACHE_BACKUP_KEY, ACL_CACHE_BAK_HASH_KEY, ACL_CACHE_BAK_COMMIT_KEY, serialized);
+
   Serial.print("Saved ");
   Serial.print(g_accessMappings.size());
   Serial.println(" access mappings to NVS.");
 }
 
 void loadMappingsFromNvs() {
-  g_preferences.begin("accesscfg", true);
-  String serialized = g_preferences.getString(ACL_CACHE_KEY, "");
-  if (serialized.length() == 0) {
-    serialized = g_preferences.getString(ACL_CACHE_BACKUP_KEY, "");
-    if (serialized.length() > 0) {
-      Serial.println("Primary ACL cache missing; restoring from backup.");
+  String serialized;
+  if (validateCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized)) {
+    Serial.print("ACL cache loaded from primary key: ");
+    Serial.println(serialized);
+  } else {
+    Serial.println("Primary ACL cache invalid or missing; trying backup.");
+    if (validateCacheEntry(ACL_CACHE_BACKUP_KEY, ACL_CACHE_BAK_HASH_KEY, ACL_CACHE_BAK_COMMIT_KEY, serialized)) {
+      Serial.println("ACL cache loaded from backup; restoring primary.");
       Serial.print("ACL cache raw data from backup NVS: ");
       Serial.println(serialized);
-      g_preferences.end();
-      g_preferences.begin("accesscfg", false);
-      g_preferences.putString(ACL_CACHE_KEY, serialized);
-      g_preferences.end();
+      saveCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized);
     } else {
-      g_preferences.end();
-      Serial.println("ACL cache load: no data found in NVS.");
+      Serial.println("ACL cache load: no valid cache found in NVS.");
+      g_accessMappings.clear();
+      return;
     }
-  } else {
-    Serial.print("ACL cache raw data from NVS: ");
-    Serial.println(serialized);
-    g_preferences.end();
   }
 
   g_accessMappings.clear();
-  if (serialized.length() == 0) return;
-
   int pos = 0;
   while (pos < (int)serialized.length()) {
     int colonPos = serialized.indexOf(':', pos);
@@ -1009,11 +1041,11 @@ void readRfidInput() {
 /////////////// Main access control logic below ////////////
 
 void unlockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, LOW);
+  digitalWrite(MAGLOCK_RELAY, HIGH);
 }
 
 void lockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, HIGH);
+  digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
 void feedbackProcessing(bool withBuzzer = true) {
@@ -1517,7 +1549,7 @@ void setup(){
   digitalWrite(LED_REJECTED, LOW);
   digitalWrite(LED_AUTHORIZED, LOW);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(MAGLOCK_RELAY, HIGH);
+  digitalWrite(MAGLOCK_RELAY, LOW);
 
   // test all outputs by turning them on for 1 second
   digitalWrite(LED_REJECTED, HIGH);
@@ -1532,9 +1564,9 @@ void setup(){
   digitalWrite(BUZZER, HIGH);
   delay(1000);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(MAGLOCK_RELAY, HIGH); // Ensure maglock is locked at boot
+  digitalWrite(MAGLOCK_RELAY, LOW); // Ensure maglock is locked at boot
   delay(1000); 
-  digitalWrite(MAGLOCK_RELAY, HIGH);
+  digitalWrite(MAGLOCK_RELAY, LOW);
 
   connectToConfiguredWiFi();
   initRfidReader();
