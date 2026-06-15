@@ -278,8 +278,33 @@ void parseMappingsFromJson(const String &json) {
   }
 }
 
+// void fetchAccessMappings() {
+//   if (WiFi.status() != WL_CONNECTED) return;
+
+//   HTTPClient http;
+//   http.begin(API_URL);
+//   if (g_apiKey.length() > 0) {
+//     http.addHeader("X-API-Key", g_apiKey);
+//   }
+
+//   Serial.println("Fetching access mappings from server...");
+//   const int code = http.GET();
+//   if (code == 200) {
+//     parseMappingsFromJson(http.getString());
+//     saveMappingsToNvs();
+//   } else {
+//     Serial.print("Failed to fetch access mappings, HTTP: ");
+//     Serial.println(code);
+//   }
+//   http.end();
+//   g_lastMappingsFetchMs = millis();
+// }
+
 void fetchAccessMappings() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Mappings fetch: WiFi not connected, skipping.");
+    return;
+  }
 
   HTTPClient http;
   http.begin(API_URL);
@@ -289,9 +314,21 @@ void fetchAccessMappings() {
 
   Serial.println("Fetching access mappings from server...");
   const int code = http.GET();
+  Serial.print("Mappings HTTP response: ");
+  Serial.println(code);
+  
   if (code == 200) {
-    parseMappingsFromJson(http.getString());
+    String response = http.getString();
+    Serial.print("Response length: ");
+    Serial.println(response.length());
+    Serial.println("Response (first 500 chars):");
+    Serial.println(response.substring(0, 500));
+    
+    parseMappingsFromJson(response);
     saveMappingsToNvs();
+    
+    Serial.print("Cache now contains: ");
+    Serial.println(g_accessMappings.size());
   } else {
     Serial.print("Failed to fetch access mappings, HTTP: ");
     Serial.println(code);
@@ -1127,7 +1164,30 @@ void handlePairingWiegandInput(const String &wiegandId) {
   sendToServer(pairedId, false);
 }
 
+// void applyAccessDecisionFromCache(const String &accessId) {
+//   auto it = g_accessMappings.find(accessId);
+//   if (it != g_accessMappings.end()) {
+//     Serial.print("Cache fallback for ID ");
+//     Serial.print(accessId);
+//     Serial.println(it->second ? ": GRANT" : ": REJECT");
+//     if (it->second) {
+//       grant();
+//     } else {
+//       feedbackReject();
+//     }
+//   } else {
+//     Serial.println("No cached decision for this ID. Rejecting.");
+//     feedbackReject();
+//   }
+// }
+
 void applyAccessDecisionFromCache(const String &accessId) {
+  Serial.print("Cache lookup for: ");
+  Serial.println(accessId);
+  Serial.print("Cache contains ");
+  Serial.print(g_accessMappings.size());
+  Serial.println(" entries");
+  
   auto it = g_accessMappings.find(accessId);
   if (it != g_accessMappings.end()) {
     Serial.print("Cache fallback for ID ");
@@ -1140,6 +1200,14 @@ void applyAccessDecisionFromCache(const String &accessId) {
     }
   } else {
     Serial.println("No cached decision for this ID. Rejecting.");
+    // Debug: print first 5 cache keys
+    int count = 0;
+    for (auto &entry : g_accessMappings) {
+      if (count >= 5) break;
+      Serial.print("  Cache key: ");
+      Serial.println(entry.first);
+      count++;
+    }
     feedbackReject();
   }
 }
@@ -1195,10 +1263,35 @@ void handleTamperSwitch() {
 void sendToServer(const String &accessId, bool playProcessingFeedback) {
   Serial.print("Processing access ID: ");
   Serial.println(accessId);
+
+  changeoverControlTo("THIS_DEVICE");
+  feedbackProcessing(playProcessingFeedback);
+
+  // Check cache
+  auto it = g_accessMappings.find(accessId);
+  bool inCache = (it != g_accessMappings.end());
+  bool cacheDecision = inCache ? it->second : false;
+
+  // If in cache with GRANT, use it immediately (optimization: no need to query server)
+  if (inCache && cacheDecision) {
+    Serial.print("Cache hit for ID ");
+    Serial.print(accessId);
+    Serial.println(": GRANT (using immediately)");
+    grant();
+    return;
+  }
+
+  // Try server if WiFi is connected (for cache REJECT or cache miss)
   if (WiFi.status() == WL_CONNECTED) {
-
-    changeoverControlTo("THIS_DEVICE");
-
+    if (inCache) {
+      Serial.print("Cache hit for ID ");
+      Serial.print(accessId);
+      Serial.println(": REJECT (trying server override)");
+    } else {
+      Serial.print("Cache miss for ID ");
+      Serial.println(accessId);
+    }
+    
     HTTPClient http;
     http.begin(API_URL);
     http.addHeader("Content-Type", "application/json");
@@ -1207,38 +1300,50 @@ void sendToServer(const String &accessId, bool playProcessingFeedback) {
     }
 
     String payload = "{\"access_id\":\"" + accessId + "\"}";
-    feedbackProcessing(playProcessingFeedback);
     int httpResponseCode = http.POST(payload);
 
     if (httpResponseCode > 0) {
-      // Server responded — use its decision, do not touch cache.
+      // Server responded — use its decision and cache it
       const String response = http.getString();
       http.end();
-      if (httpResponseCode == 200 && response.indexOf("\"access\": \"GRANT\"") >= 0) {
-        Serial.println("Access granted by server");
+      bool isGrant = (httpResponseCode == 200 && response.indexOf("\"access\": \"GRANT\"") >= 0);
+      
+      // Cache the decision
+      g_accessMappings[accessId] = isGrant;
+      saveMappingsToNvs();
+      
+      Serial.print("Server response for ID ");
+      Serial.print(accessId);
+      Serial.println(isGrant ? ": GRANT" : ": REJECT");
+      
+      if (isGrant) {
         grant();
       } else {
-        Serial.println("Access denied by server");
         feedbackReject();
       }
       return;
     }
 
     http.end();
-    // POST failed (network-level error): fall through to cache below.
-    Serial.print("POST failed, HTTP: ");
+    Serial.print("Server POST failed, HTTP: ");
     Serial.println(httpResponseCode);
-
-    // Fallback: use cached decision when server is unreachable.
-    applyAccessDecisionFromCache(accessId);
-
-  } else {
-    Serial.println("WiFi not connected.");
-    changeoverControlTo("THIS_DEVICE");
-    feedbackProcessing(playProcessingFeedback);
-    applyAccessDecisionFromCache(accessId);
   }
 
+  // Server unavailable or unreachable: use cache fallback or reject
+  if (inCache) {
+    Serial.print("Using cache fallback for ID ");
+    Serial.print(accessId);
+    Serial.println(cacheDecision ? ": GRANT" : ": REJECT");
+    if (cacheDecision) {
+      grant();
+    } else {
+      feedbackReject();
+    }
+  } else {
+    Serial.print("No cache entry and server unreachable for ID ");
+    Serial.println(accessId);
+    feedbackReject();
+  }
 }
 
 void setup(){
@@ -1306,7 +1411,7 @@ void setup(){
   digitalWrite(BUZZER, HIGH);
   delay(1000);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(MAGLOCK_RELAY, LOW);
+  digitalWrite(MAGLOCK_RELAY, HIGH); // Ensure maglock is locked at boot
   delay(1000); 
   digitalWrite(MAGLOCK_RELAY, HIGH);
 
