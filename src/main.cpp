@@ -78,12 +78,10 @@ struct StringLess {
 std::map<String, bool, StringLess> g_accessMappings; // device_access_id -> true=GRANT, false=REJECT
 unsigned long g_lastMappingsFetchMs = 0;
 
-const char *ACL_CACHE_KEY = "acl_cache";
-const char *ACL_CACHE_HASH_KEY = "acl_cache_hash";
-const char *ACL_CACHE_COMMIT_KEY = "acl_cache_ok";
-const char *ACL_CACHE_BACKUP_KEY = "acl_cache_bak";
-const char *ACL_CACHE_BAK_HASH_KEY = "acl_cache_bak_hash";
-const char *ACL_CACHE_BAK_COMMIT_KEY = "acl_cache_bak_ok";
+// NVS key names must be <= 15 chars on ESP32 Preferences.
+const char *ACL_CACHE_KEY = "aclp";
+const char *ACL_CACHE_HASH_KEY = "aclp_h";
+const char *ACL_CACHE_COMMIT_KEY = "aclp_ok";
 
 MFRC522 g_mfrc522(RC522_SS_PIN, RC522_RST_PIN);
 String g_lastRfidUidHex;
@@ -216,31 +214,83 @@ uint32_t computeCacheHash(const String &value) {
   return hash;
 }
 
+bool readCacheBlob(const char *cacheKey, String &outValue) {
+  g_preferences.begin("accesscfg", true);
+  const size_t blobLen = g_preferences.getBytesLength(cacheKey);
+  if (blobLen == 0) {
+    g_preferences.end();
+    return false;
+  }
+
+  char *buffer = static_cast<char *>(malloc(blobLen + 1));
+  if (buffer == nullptr) {
+    g_preferences.end();
+    Serial.println("ACL cache read failed: out of memory.");
+    return false;
+  }
+
+  const size_t readLen = g_preferences.getBytes(cacheKey, buffer, blobLen);
+  g_preferences.end();
+  buffer[readLen] = '\0';
+  outValue = String(buffer);
+  free(buffer);
+  return readLen > 0;
+}
+
 bool validateCacheEntry(const char *cacheKey, const char *hashKey, const char *commitKey, String &outValue) {
   g_preferences.begin("accesscfg", true);
   const bool isCommitted = g_preferences.getBool(commitKey, false);
-  outValue = g_preferences.getString(cacheKey, "");
   const String storedHash = g_preferences.getString(hashKey, "");
   g_preferences.end();
+
+  if (!readCacheBlob(cacheKey, outValue)) {
+    return false;
+  }
 
   if (!isCommitted || outValue.length() == 0 || storedHash.length() == 0) {
     return false;
   }
 
   const uint32_t expectedHash = computeCacheHash(outValue);
-  return storedHash.toInt() == expectedHash;
+  const uint32_t storedHashValue = static_cast<uint32_t>(strtoul(storedHash.c_str(), nullptr, 10));
+  return storedHashValue == expectedHash;
 }
 
-void saveCacheEntry(const char *cacheKey, const char *hashKey, const char *commitKey, const String &serialized) {
+void cleanupLegacyAclKeys() {
+  g_preferences.begin("accesscfg", false);
+  // Remove old/unused keys to free NVS entries after cache format changes.
+  g_preferences.remove("aclb");
+  g_preferences.remove("aclb_h");
+  g_preferences.remove("aclb_ok");
+  g_preferences.remove("acl_cache");
+  g_preferences.remove("acl_cache_h");
+  g_preferences.remove("acl_cache_ok");
+  g_preferences.end();
+}
+
+bool saveCacheEntry(const char *cacheKey, const char *hashKey, const char *commitKey, const String &serialized) {
   const uint32_t hash = computeCacheHash(serialized);
   const String hashStr = String(hash);
 
   g_preferences.begin("accesscfg", false);
   g_preferences.putBool(commitKey, false);
-  g_preferences.putString(cacheKey, serialized);
-  g_preferences.putString(hashKey, hashStr);
-  g_preferences.putBool(commitKey, true);
+  const size_t written = g_preferences.putBytes(cacheKey, serialized.c_str(), serialized.length());
+  const size_t hashWritten = g_preferences.putString(hashKey, hashStr);
+  bool success = false;
+  if (written == serialized.length() && hashWritten > 0) {
+    g_preferences.putBool(commitKey, true);
+    success = true;
+  } else {
+    Serial.print("ACL cache save failed for key ");
+    Serial.print(cacheKey);
+    Serial.print(" (written=");
+    Serial.print(written);
+    Serial.print(" of ");
+    Serial.print(serialized.length());
+    Serial.println(")");
+  }
   g_preferences.end();
+  return success;
 }
 
 void saveMappingsToNvs() {
@@ -257,8 +307,11 @@ void saveMappingsToNvs() {
     return;
   }
 
-  saveCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized);
-  saveCacheEntry(ACL_CACHE_BACKUP_KEY, ACL_CACHE_BAK_HASH_KEY, ACL_CACHE_BAK_COMMIT_KEY, serialized);
+  const bool primarySaved = saveCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized);
+  if (!primarySaved) {
+    Serial.println("Failed to persist ACL cache to NVS.");
+    return;
+  }
 
   Serial.print("Saved ");
   Serial.print(g_accessMappings.size());
@@ -271,17 +324,9 @@ void loadMappingsFromNvs() {
     Serial.print("ACL cache loaded from primary key: ");
     Serial.println(serialized);
   } else {
-    Serial.println("Primary ACL cache invalid or missing; trying backup.");
-    if (validateCacheEntry(ACL_CACHE_BACKUP_KEY, ACL_CACHE_BAK_HASH_KEY, ACL_CACHE_BAK_COMMIT_KEY, serialized)) {
-      Serial.println("ACL cache loaded from backup; restoring primary.");
-      Serial.print("ACL cache raw data from backup NVS: ");
-      Serial.println(serialized);
-      saveCacheEntry(ACL_CACHE_KEY, ACL_CACHE_HASH_KEY, ACL_CACHE_COMMIT_KEY, serialized);
-    } else {
-      Serial.println("ACL cache load: no valid cache found in NVS.");
-      g_accessMappings.clear();
-      return;
-    }
+    Serial.println("ACL cache load: no valid primary cache found in NVS.");
+    g_accessMappings.clear();
+    return;
   }
 
   g_accessMappings.clear();
@@ -401,6 +446,8 @@ void fetchAccessMappings() {
 }
 
 void loadRuntimeConfig() {
+  cleanupLegacyAclKeys();
+
   g_preferences.begin("accesscfg", true);
   g_wifiSsid = g_preferences.getString("ssid", WIFI_SSID);
   g_wifiPassword = g_preferences.getString("pass", WIFI_PASSWORD);
