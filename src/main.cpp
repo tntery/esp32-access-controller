@@ -554,7 +554,7 @@ String buildConfigPageHtml(const String &message) {
     (message.length() ? ("<div class='msg'>" + htmlEscape(message) + "</div>") : String("")) +
     "<form method='POST' action='/save'>"
     "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(g_wifiSsid) + "' required>"
-    "<label>WiFi Password</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
+    "<label>WiFi Password (leave blank for open network)</label><input type='password' name='password' value='" + htmlEscape(g_wifiPassword) + "'>"
     "<label>Setup AP Password (8-63 chars, leave blank to keep current)</label><input type='password' name='ap_password' value='' minlength='8' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
     "<label>Setup Page Password (4-63 chars, leave blank to keep current)</label><input type='password' name='web_password' value='' minlength='4' maxlength='63' autocomplete='new-password' placeholder='Leave blank to keep current password'>"
     "<label>API Key</label><input name='api_key' value='" + htmlEscape(g_apiKey) + "'>"
@@ -593,9 +593,8 @@ void configureWebRoutes() {
     const bool previousTamperEnabled = g_tamperEnabled;
     g_tamperEnabled = g_webServer.hasArg("tamper_enabled");
 
-    if (requestedWifiPassword.length() > 0) {
-      g_wifiPassword = requestedWifiPassword;
-    }
+    // Empty WiFi password is a valid, intentional value for open networks.
+    g_wifiPassword = requestedWifiPassword;
 
     if (requestedApPassword.length() > 0 && (requestedApPassword.length() < 8 || requestedApPassword.length() > 63)) {
       g_webServer.send(400, "text/html", buildConfigPageHtml("AP password must be 8 to 63 characters."));
