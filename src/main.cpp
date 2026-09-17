@@ -1087,11 +1087,11 @@ void readRfidInput() {
 /////////////// Main access control logic below ////////////
 
 void unlockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, HIGH);
+  digitalWrite(MAGLOCK_RELAY, LOW);
 }
 
 void lockMaglock() {
-  digitalWrite(MAGLOCK_RELAY, LOW);
+  digitalWrite(MAGLOCK_RELAY, HIGH);
 }
 
 void feedbackProcessing(bool withBuzzer = true) {
@@ -1613,6 +1613,9 @@ void setup(){
   digitalWrite(MAGLOCK_RELAY, LOW); // Ensure maglock is locked at boot
   delay(1000); 
   digitalWrite(MAGLOCK_RELAY, LOW);
+
+  // lock the maglock at boot to ensure the door is secured
+  lockMaglock();
 
   connectToConfiguredWiFi();
   initRfidReader();
